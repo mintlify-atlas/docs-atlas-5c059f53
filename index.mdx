@@ -1,97 +1,93 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Profluent E1"
+description: "Best-in-class protein encoder models for single-sequence and retrieval-augmented protein representation."
 ---
 
-## Setting up
+Profluent E1 is a family of protein language models (150M–600M parameters) that generate high-quality sequence embeddings and per-residue logits. E1 models are drop-in replacements for the ESM model family, supporting both single-sequence and retrieval-augmented (homolog-aware) inference out of the box.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Installation" icon="circle-down" href="/installation">
+    Install E1 and its dependencies in minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Load a model and run your first inference in five lines of Python.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Guides" icon="book-open" href="/guides/single-sequence-inference">
+    Embeddings, fitness prediction, site saturation mutagenesis, and more.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/e1-for-masked-lm">
+    Full reference for all public classes, methods, and CLI tools.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Available models
 
-Everything you need to create world-class documentation.
+| Model | Parameters | HuggingFace |
+|-------|-----------|-------------|
+| E1-150m | 150M | [Profluent-Bio/E1-150m](https://huggingface.co/Profluent-Bio/E1-150m) |
+| E1-300m | 300M | [Profluent-Bio/E1-300m](https://huggingface.co/Profluent-Bio/E1-300m) |
+| E1-600m | 600M | [Profluent-Bio/E1-600m](https://huggingface.co/Profluent-Bio/E1-600m) |
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+Model weights are downloaded automatically from HuggingFace on first use.
 
-## Need inspiration?
+## Key capabilities
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<CardGroup cols={2}>
+  <Card title="Single-sequence inference" icon="dna" href="/guides/single-sequence-inference">
+    Encode any protein sequence to get per-residue logits and embeddings.
+  </Card>
+  <Card title="Retrieval-augmented inference" icon="magnifying-glass" href="/guides/retrieval-augmented-inference">
+    Prepend homologous sequences to boost representation quality.
+  </Card>
+  <Card title="Zero-shot fitness prediction" icon="chart-line" href="/guides/fitness-prediction">
+    Score mutant variants against a wild-type parent without any fine-tuning.
+  </Card>
+  <Card title="Site saturation mutagenesis" icon="flask" href="/guides/site-saturation-mutagenesis">
+    In-silico SSM using masked-marginal or wildtype-marginal scoring.
+  </Card>
+</CardGroup>
+
+## Get started
+
+<Steps>
+  <Step title="Install the package">
+    Clone the repository and install with pip:
+    ```bash
+    git clone https://github.com/Profluent-AI/E1.git
+    cd E1 && pip3 install -e .
+    ```
+  </Step>
+  <Step title="Load a model">
+    Models are loaded directly from HuggingFace:
+    ```python
+    from E1.modeling import E1ForMaskedLM
+    model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-300m").to("cuda:0")
+    model.eval()
+    ```
+  </Step>
+  <Step title="Run inference">
+    Prepare a batch and run a forward pass:
+    ```python
+    from E1.batch_preparer import E1BatchPreparer
+    batch_preparer = E1BatchPreparer()
+    batch = batch_preparer.get_batch_kwargs(["MFCATEEKL"], device="cuda:0")
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+        outputs = model(
+            input_ids=batch["input_ids"],
+            within_seq_position_ids=batch["within_seq_position_ids"],
+            global_position_ids=batch["global_position_ids"],
+            sequence_ids=batch["sequence_ids"],
+            past_key_values=None,
+            use_cache=False,
+        )
+    embeddings = outputs.embeddings  # (B, L, E)
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+  For GPU users with CUDA capability 8.0+ (Ampere and newer), install `flash-attn` for faster inference:
+  ```bash
+  pip3 install flash-attn --no-build-isolation
+  ```
+</Tip>

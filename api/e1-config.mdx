@@ -1,0 +1,173 @@
+---
+title: "E1Config"
+description: "Configuration class for E1 model architecture."
+---
+
+`E1Config` stores every architectural and training hyperparameter for the E1 model. It extends HuggingFace `PretrainedConfig` and is serialized to / deserialized from `config.json` when you call `from_pretrained` or `save_pretrained`.
+
+```python
+from E1.config import E1Config
+
+config = E1Config(hidden_size=4096, num_hidden_layers=40)
+```
+
+<Note>
+  `vocab_size`, `pad_token_id`, `bos_token_id`, and `eos_token_id` are derived automatically from the built-in E1 tokenizer. You do not need to set them manually. Passing a smaller `vocab_size` is accepted with a warning; passing a larger one pads the embedding table.
+</Note>
+
+---
+
+## Constructor
+
+```python
+class E1Config(PretrainedConfig):
+    model_type = "E1"
+
+    def __init__(
+        self,
+        hidden_size: int = 4096,
+        intermediate_size: int = 16384,
+        gated_mlp: bool = False,
+        num_hidden_layers: int = 40,
+        num_attention_heads: int = 32,
+        num_key_value_heads: int = 8,
+        hidden_act: str = "silu",
+        rms_norm_eps: float = 1e-5,
+        initializer_range: float = 0.02,
+        torch_dtype: str = "bfloat16",
+        gradient_checkpointing: bool = False,
+        no_ffn_gradient_checkpointing: bool = False,
+        global_attention_every_n_layers: int = 0,
+        max_num_sequences: int = 512,
+        max_num_positions_within_seq: int = 8192,
+        max_num_positions_global: int = 131072,
+        rope_theta_within_seq: float = 10000.0,
+        rope_theta_global: float = 100000.0,
+        clip_qkv: float | None = None,
+        **kwargs,
+    ) -> None
+```
+
+---
+
+## Parameters
+
+### Architecture
+
+<ParamField path="hidden_size" type="integer" default="4096">
+  Dimensionality of the token embeddings and all hidden states.
+</ParamField>
+
+<ParamField path="intermediate_size" type="integer" default="16384">
+  Hidden dimensionality of the feed-forward network. When `None`, defaults to `3 × hidden_size` (gated MLP) or `4 × hidden_size` (standard MLP).
+</ParamField>
+
+<ParamField path="gated_mlp" type="boolean" default="false">
+  Use a SwiGLU-style gated MLP instead of a standard MLP. When `True` and `intermediate_size` is `None`, `intermediate_size` is set to `3 × hidden_size`.
+</ParamField>
+
+<ParamField path="num_hidden_layers" type="integer" default="40">
+  Number of transformer decoder layers.
+</ParamField>
+
+<ParamField path="num_attention_heads" type="integer" default="32">
+  Number of query attention heads.
+</ParamField>
+
+<ParamField path="num_key_value_heads" type="integer" default="8">
+  Number of key/value heads for grouped-query attention (GQA). Set equal to `num_attention_heads` to use standard multi-head attention.
+</ParamField>
+
+<ParamField path="hidden_act" type="string" default='"silu"'>
+  Activation function for the feed-forward layer. The built-in tokenizer uses `"silu"` (SiLU / Swish).
+</ParamField>
+
+<ParamField path="rms_norm_eps" type="float" default="1e-5">
+  Epsilon for RMSNorm layers. Added to the denominator for numerical stability.
+</ParamField>
+
+<ParamField path="initializer_range" type="float" default="0.02">
+  Standard deviation of the normal distribution used to initialize linear and embedding weights.
+</ParamField>
+
+<ParamField path="torch_dtype" type="string" default='"bfloat16"'>
+  Default floating-point dtype string stored in the config for reference. The model is loaded in `float32` during inference and cast via `torch.autocast`.
+</ParamField>
+
+### Training
+
+<ParamField path="gradient_checkpointing" type="boolean" default="false">
+  Enable activation checkpointing across all layers to reduce peak GPU memory during training. Incompatible with `use_cache=True`.
+</ParamField>
+
+<ParamField path="no_ffn_gradient_checkpointing" type="boolean" default="false">
+  When `gradient_checkpointing=True`, skip checkpointing for feed-forward sub-layers. Can reduce recomputation overhead at the cost of higher memory.
+</ParamField>
+
+### Attention
+
+<ParamField path="global_attention_every_n_layers" type="integer" default="0">
+  Interval at which a global (full-sequence) attention layer is inserted. `0` disables global attention; all layers use block-causal attention over the multi-sequence packing.
+</ParamField>
+
+<ParamField path="clip_qkv" type="float" default="None">
+  When set to a positive float, query, key, and value projections are clipped to `[-clip_qkv, clip_qkv]` before the attention computation. `None` disables clipping.
+</ParamField>
+
+### Positional encoding
+
+<ParamField path="max_num_sequences" type="integer" default="512">
+  Size of the sequence-ID embedding table. Must be larger than the maximum number of sequences packed into a single input.
+</ParamField>
+
+<ParamField path="max_num_positions_within_seq" type="integer" default="8192">
+  Maximum within-sequence position supported by the within-sequence RoPE. Sequences longer than this raise an assertion error during the forward pass.
+</ParamField>
+
+<ParamField path="max_num_positions_global" type="integer" default="131072">
+  Maximum global position supported by the global RoPE (128 × 1024 = 131 072 by default).
+</ParamField>
+
+<ParamField path="rope_theta_within_seq" type="float" default="10000.0">
+  Base frequency for rotary positional embeddings applied within each individual sequence.
+</ParamField>
+
+<ParamField path="rope_theta_global" type="float" default="100000.0">
+  Base frequency for rotary positional embeddings applied across the full packed context.
+</ParamField>
+
+---
+
+## Derived / automatic fields
+
+| Field | Source |
+|---|---|
+| `vocab_size` | Set automatically from `tokenizer.get_vocab_size()`. Overridable with a warning. |
+| `pad_token_id` | `tokenizer.token_to_id("<pad>")` |
+| `bos_token_id` | `tokenizer.token_to_id("<bos>")` |
+| `eos_token_id` | `tokenizer.token_to_id("<eos>")` |
+
+---
+
+## Usage example
+
+```python
+from E1.config import E1Config
+from E1.modeling import E1ForMaskedLM
+
+# Build a smaller model for testing
+config = E1Config(
+    hidden_size=512,
+    intermediate_size=2048,
+    num_hidden_layers=4,
+    num_attention_heads=8,
+    num_key_value_heads=4,
+)
+model = E1ForMaskedLM(config)
+print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+# Load a published checkpoint (config is loaded automatically)
+model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-300m")
+print(model.config.hidden_size)       # 4096 (for E1-300m and E1-600m)
+print(model.config.num_hidden_layers) # 40
+```

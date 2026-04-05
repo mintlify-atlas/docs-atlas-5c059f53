@@ -1,0 +1,141 @@
+---
+title: "Retrieval-augmented inference"
+description: "Use homologous sequences as context to improve protein representations."
+---
+
+E1 can incorporate homologous sequences to produce richer representations of a query protein. By prepending one or more homologs to your query — separated by commas — the model processes all sequences together under a **block-causal attention** pattern: each homolog attends within itself, and the query attends to all context sequences. This allows the model to leverage evolutionary information without any fine-tuning.
+
+## Context format
+
+Pass context and query as a single comma-separated string:
+
+```
+"HOM1,HOM2,QUERY"
+```
+
+The **last** sequence is always treated as the query. Everything before the final comma is context.
+
+<CardGroup cols={2}>
+  <Card title="Multiple homologs">
+    `"HOM1,HOM2,HOM3,QUERY"` — stack as many homologs as your token budget allows; the query is always the rightmost sequence.
+  </Card>
+  <Card title="Limits">
+    Up to **511 homologs** (the model supports `max_num_sequences=512`, which includes the query). Each individual sequence can be up to **8 192 residues**.
+  </Card>
+</CardGroup>
+
+<Note>
+  Sequences must be uppercase A–Z. Use `?` as the mask token only in the query sequence. The homolog sequences in the context should be fully specified (no mask tokens).
+</Note>
+
+## Complete workflow
+
+<Steps>
+  <Step title="Load the model and batch preparer">
+    ```python
+    import torch
+    from E1.batch_preparer import E1BatchPreparer
+    from E1.modeling import E1ForMaskedLM
+
+    model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-300m").to("cuda:0")
+    model.eval()
+
+    batch_preparer = E1BatchPreparer()
+    ```
+  </Step>
+
+  <Step title="Build a retrieval-augmented input">
+    Include your homologs before the query, separated by commas. The query here has a masked position (`?`):
+
+    ```python
+    sequences = ["MFCATEEKL,MCCASDF,MFCC?SEF"]
+    batch = batch_preparer.get_batch_kwargs(sequences, device="cuda:0")
+    ```
+  </Step>
+
+  <Step title="Run the forward pass">
+    ```python
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+        outputs = model(
+            input_ids=batch["input_ids"],
+            within_seq_position_ids=batch["within_seq_position_ids"],
+            global_position_ids=batch["global_position_ids"],
+            sequence_ids=batch["sequence_ids"],
+            past_key_values=None,
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=False,
+        )
+
+    logits: torch.Tensor = outputs.logits      # (B, L, V) — covers ALL sequences
+    embeddings: torch.Tensor = outputs.embeddings  # (B, L, E) — covers ALL sequences
+    ```
+  </Step>
+
+  <Step title="Extract query outputs with selectors">
+    The model produces logits and embeddings for **all** sequences (context + query). Use the boolean selectors below to isolate only the query residues:
+
+    ```python
+    # last_sequence_selector: True for tokens belonging to the last (query) sequence,
+    # including its boundary tokens.
+    last_sequence_selector = batch["sequence_ids"] == batch["sequence_ids"].max(dim=1)[0][:, None]
+
+    # residue_selector: True for amino-acid tokens only (excludes <bos>, <eos>, 1, 2, <pad>).
+    residue_selector = ~(batch_preparer.get_boundary_token_mask(batch["input_ids"]))
+
+    # Combined: True only for query residues (no boundary tokens, no context sequences).
+    last_sequence_residue_selector = last_sequence_selector & residue_selector
+
+    # Extract per-residue embeddings for the query sequence in each batch element.
+    # For sequences=["MFCATEEKL,MCCASDF,MFCC?SEF"] this yields embeddings for "MFCC?SEF".
+    last_sequence_embeddings = [
+        embeddings[i, last_sequence_residue_selector[i]]
+        for i in range(embeddings.shape[0])
+    ]
+    ```
+  </Step>
+</Steps>
+
+## Attention pattern
+
+E1 uses a **block-causal** attention mask computed from `sequence_ids`. Under this pattern:
+
+- Each context sequence attends only to tokens within itself.
+- The query sequence (last sequence) attends to all tokens: its own and all context sequences.
+- Context sequences do **not** attend to the query, preserving information flow in one direction.
+
+This allows the KV cache to be shared across queries that share the same context, which is exploited by `E1Predictor` for efficient batch inference.
+
+## Using E1Predictor for batch retrieval-augmented inference
+
+`E1Predictor` automates batching, KV caching, and output extraction. Pass homologs via `context_seqs`:
+
+```python
+from E1.modeling import E1ForMaskedLM
+from E1.predictor import E1Predictor
+
+model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-300m").to("cuda:0")
+model.eval()
+
+predictor = E1Predictor(model, max_batch_tokens=65536, use_cache=True)
+
+sequences = ["MFCC?SEF", "ACDEFGHIK"]
+context_seqs = {"ctx1": "MFCATEEKL"}
+
+for prediction in predictor.predict(sequences, context_seqs=context_seqs):
+    seq_id = prediction["id"]
+    context_id = prediction["context_id"]  # "ctx1"
+    embeddings = prediction["token_embeddings"]  # (L, E) — query residues only
+```
+
+When `context_seqs` is provided, `E1Predictor` automatically:
+1. Prepends each context sequence to every query, creating `"ctx1_seq,query"` inputs.
+2. Groups sequences that share the same context into the same batch.
+3. If `use_cache=True`, computes context KV states once and reuses them across queries.
+4. Returns only the query residue outputs in `token_embeddings` and `logits`.
+
+The `context_id` field in each prediction identifies which context was used, which is useful when scoring against multiple contexts.
+
+<Warning>
+  When using multiple entries in `context_seqs`, every query is scored against every context. The number of predictions yielded equals `len(sequences) × len(context_seqs)`.
+</Warning>

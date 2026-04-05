@@ -1,0 +1,80 @@
+---
+title: "Tokenization"
+description: "How E1 tokenizes protein sequences."
+---
+
+E1 uses a character-level tokenizer: each amino acid letter maps to exactly one token. There is no subword splitting or byte-pair encoding. The vocabulary consists of the 26 uppercase letters (A–Z), plus a small set of special tokens.
+
+## Special tokens
+
+| Token | Role |
+|---|---|
+| `<bos>` | Beginning of sequence |
+| `<eos>` | End of sequence |
+| `<pad>` | Padding (used to batch sequences of different lengths) |
+| `1` | Boundary marker — placed immediately after `<bos>` |
+| `2` | Boundary marker — placed immediately before `<eos>` |
+| `?` | Mask token — used for masked language modeling |
+
+## Sequence format
+
+Every protein sequence is wrapped in a `<bos>…<eos>` block with boundary markers:
+
+```
+<bos> 1 [RESIDUES] 2 <eos>
+```
+
+For a multi-sequence input (e.g., context homologs followed by a query), each subsequence gets its own complete block:
+
+```
+<bos> 1 [SEQ_1] 2 <eos>  <bos> 1 [SEQ_2] 2 <eos>  ...  <bos> 1 [QUERY] 2 <eos>
+```
+
+The `E1BatchPreparer.prepare_singleseq` method constructs tokens as:
+
+```python
+tokens = ["<bos>", "1", *sequence, "2", "<eos>"]
+```
+
+## Position ID arrays
+
+Each batch element carries three parallel integer arrays of the same length as `input_ids`:
+
+**`within_seq_position_ids`** — position of each token within its own sequence block. Resets to `0` at the start of every `<bos>` token.
+
+**`global_position_ids`** — monotonically increasing position across all tokens in the concatenated input. Does not reset between sequences.
+
+**`sequence_ids`** — which sequence slot a token belongs to (`0` for the first sequence, `1` for the second, etc.). Padding tokens receive `-1`.
+
+### Example
+
+For the input `"ABC,DEF"` (two sequences), the tokenized batch looks like:
+
+```
+Tokens:   <bos> 1 A B C 2 <eos>  <bos> 1 D E F 2 <eos>
+```
+
+| Array | Values |
+|---|---|
+| `within_seq_position_ids` | `[0, 1, 2, 3, 4, 5, 6,  0, 1, 2, 3, 4, 5, 6]` |
+| `global_position_ids` | `[0, 1, 2, 3, 4, 5, 6,  7, 8, 9, 10, 11, 12, 13]` |
+| `sequence_ids` | `[0, 0, 0, 0, 0, 0, 0,  1, 1, 1, 1, 1, 1, 1]` |
+
+`within_seq_position_ids` restarts at `0` for the second sequence; `global_position_ids` continues from `7`.
+
+## Boundary token mask
+
+`E1BatchPreparer.get_boundary_token_mask` returns a boolean mask that is `True` for every token in the set `{<bos>, <eos>, 1, 2, <pad>}`. These tokens are excluded from MLM loss computation — only residue tokens (and `?`) are scored.
+
+## Sequence validation
+
+Before tokenization, `validate_sequence` checks that the input string contains only uppercase A–Z characters and optional `?` mask tokens. Invalid characters raise a `ValueError`. You can also set `remove_X_tokens=True` in `DataPrepConfig` to silently drop `X` (unknown amino acid) tokens from the token stream rather than treating them as valid residues.
+
+## Padding
+
+When batching multiple sequences together, shorter sequences are right-padded to the length of the longest sequence in the batch:
+
+- `input_ids` and `labels` are padded with `<pad>` token ID.
+- `sequence_ids`, `within_seq_position_ids`, and `global_position_ids` are padded with `-1`.
+
+The value `-1` is chosen deliberately because `0` is a valid position and sequence ID; `-1` lets downstream code (e.g., FlexAttention mask construction) reliably distinguish real tokens from padding.

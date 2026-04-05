@@ -1,0 +1,76 @@
+---
+title: "Introduction"
+description: "Overview of the Profluent E1 protein encoder model family."
+---
+
+E1 is a family of protein encoder models trained with masked language modeling (MLM). Given an amino acid sequence, E1 produces **per-residue logits** over the vocabulary and **per-residue embeddings** that capture rich structural and functional information. E1 models are designed as drop-in replacements for the [ESM](https://github.com/facebookresearch/esm) family of models.
+
+## Model sizes
+
+Three model sizes are available, covering a range of accuracy/speed trade-offs:
+
+| Model | Parameters | HuggingFace |
+|-------|-----------|-------------|
+| E1-150m | 150M | [Profluent-Bio/E1-150m](https://huggingface.co/Profluent-Bio/E1-150m) |
+| E1-300m | 300M | [Profluent-Bio/E1-300m](https://huggingface.co/Profluent-Bio/E1-300m) |
+| E1-600m | 600M | [Profluent-Bio/E1-600m](https://huggingface.co/Profluent-Bio/E1-600m) |
+
+Model weights are downloaded automatically from HuggingFace on first use.
+
+## Inference modes
+
+E1 supports two inference modes:
+
+**Single-sequence** — Pass a single amino acid sequence. Use `?` as the mask token to query the model at specific positions.
+
+```
+AAAAA?C
+```
+
+**Retrieval-augmented** — Prepend one or more homologous sequences (comma-separated) before your query sequence. The model attends to the homologs as context, improving representation quality for the query. The query sequence is always the last comma-delimited entry.
+
+```
+MFCATEEKL,MCCASDF,MFCC?SEF
+```
+
+In this example, `MFCATEEKL` and `MCCASDF` are homologs and `MFCC?SEF` is the query.
+
+## Benchmark highlights
+
+E1 achieves best-in-class results on standard protein ML benchmarks:
+
+- **Protein Gym substitution assays** — highest average Spearman correlation on zero-shot fitness prediction across the substitution benchmark
+- **CAMEO contact map prediction** — top unsupervised contact prediction accuracy on recent CAMEO targets
+
+## Outputs
+
+The `E1ForMaskedLM` model returns two primary tensors:
+
+- `logits` — shape `(B, L, V)`: per-residue log-probabilities over the amino acid vocabulary, where `B` is batch size, `L` is sequence length (including special tokens), and `V` is vocabulary size
+- `embeddings` — shape `(B, L, E)`: per-residue hidden-state vectors, where `E` is the model's hidden dimension
+
+Use the selector utilities on `E1BatchPreparer` to extract residue-level tensors for just the query sequence, excluding boundary tokens and context sequences.
+
+## Licenses
+
+- **Code** — Apache 2.0
+- **Model weights** — similarly permissive, with additional attribution requirements; see the [NOTICE](https://github.com/Profluent-AI/E1/blob/main/NOTICE) file for details
+
+You can use, share, and modify E1 for free, but you must follow the [ATTRIBUTION](https://github.com/Profluent-AI/E1/blob/main/ATTRIBUTION) guidelines to give credit and include the license when you share.
+
+## Explore
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Load a model and run your first inference in minutes.
+  </Card>
+  <Card title="Single-sequence inference" icon="dna" href="/guides/single-sequence-inference">
+    Encode a protein sequence to get per-residue logits and embeddings.
+  </Card>
+  <Card title="Retrieval-augmented inference" icon="magnifying-glass" href="/guides/retrieval-augmented-inference">
+    Prepend homologs to boost representation quality for your query.
+  </Card>
+  <Card title="API reference" icon="code" href="/api/e1-for-masked-lm">
+    Full reference for `E1ForMaskedLM`, `E1BatchPreparer`, and `E1Predictor`.
+  </Card>
+</CardGroup>

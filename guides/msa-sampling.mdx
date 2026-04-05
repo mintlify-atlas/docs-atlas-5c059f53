@@ -1,0 +1,145 @@
+---
+title: "MSA context sampling"
+description: "Sample homologous sequences from a multiple sequence alignment for retrieval-augmented inference."
+---
+
+When running retrieval-augmented inference with E1, the quality and diversity of the homologous context sequences significantly affects the output representations. The `E1.msa_sampling` module provides utilities to draw a **diverse, informative** subset of sequences from a multiple sequence alignment (MSA) and format them for use as E1 context.
+
+<Note>
+  The MSA must be in **A3M format**. The **first sequence** in the file must be the query sequence. Downstream sequences are treated as potential context homologs.
+</Note>
+
+## Workflow overview
+
+<Steps>
+  <Step title="Obtain an MSA in A3M format">
+    Search a sequence database (e.g. UniRef90, ColabFold databases) with your query to produce an A3M file. The first record must be the query itself.
+  </Step>
+
+  <Step title="Sample a context with sample_context()">
+    `sample_context` filters MSA sequences by query similarity, weights candidates by diversity, and returns a budget-bounded context string ready for E1.
+
+    ```python
+    from E1.msa_sampling import sample_context
+
+    context_str, context_ids = sample_context(
+        msa_path="my_protein.a3m",
+        max_num_samples=511,
+        max_token_length=32768,
+        max_query_similarity=1.0,
+        min_query_similarity=0.0,
+        neighbor_similarity_lower_bound=0.8,
+        seed=42,
+    )
+    ```
+
+    `context_str` is a comma-separated string of homolog sequences: `"HOM1,HOM2,..."`.
+    `context_ids` is the list of sequence identifiers (FASTA headers) corresponding to each homolog.
+  </Step>
+
+  <Step title="Prepend context to your query and run inference">
+    ```python
+    query_sequence = "MFCATEEKL..."  # your query — same as the first sequence in the A3M
+    full_input = context_str + "," + query_sequence
+
+    # Now pass full_input to E1 as you would any retrieval-augmented sequence
+    from E1.batch_preparer import E1BatchPreparer
+    from E1.modeling import E1ForMaskedLM
+    import torch
+
+    model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-300m").to("cuda:0")
+    model.eval()
+
+    batch_preparer = E1BatchPreparer()
+    batch = batch_preparer.get_batch_kwargs([full_input], device="cuda:0")
+
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+        outputs = model(
+            input_ids=batch["input_ids"],
+            within_seq_position_ids=batch["within_seq_position_ids"],
+            global_position_ids=batch["global_position_ids"],
+            sequence_ids=batch["sequence_ids"],
+            past_key_values=None,
+            use_cache=False,
+        )
+    ```
+  </Step>
+</Steps>
+
+## ContextSpecification parameters
+
+`ContextSpecification` is a dataclass that bundles the sampling hyperparameters. You can pass its fields directly to `sample_context`, or use it with `sample_multiple_contexts`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_num_samples` | `int` | `511` | Maximum number of homologs to draw. Keep ≤ 511 since the model supports up to 512 sequences total (including the query). |
+| `max_token_length` | `int` | `32768` | Maximum total residue budget for the context. Homologs are added greedily in sampled order until this budget is reached. |
+| `max_query_similarity` | `float` | `1.0` | Exclude sequences with similarity to the query **above** this threshold. Set below 1.0 to filter near-identical sequences. |
+| `min_query_similarity` | `float` | `0.0` | Exclude sequences with similarity to the query **below** this threshold. Useful for focusing on closely related homologs. |
+| `neighbor_similarity_lower_bound` | `float` | `0.8` | Similarity threshold used to count "neighbors" for diversity weighting. Each sequence is weighted `1 / num_neighbors` to undersample over-represented clusters. |
+
+### Similarity definition
+
+Similarity between two sequences is computed as the **fraction of non-gap characters that are identical**, so gap columns do not inflate the similarity score.
+
+## Ensembling with sample_multiple_contexts
+
+Draw several diverse context subsets from the same MSA and average over their scores. This reduces variance from any single sampling draw.
+
+```python
+from E1.msa_sampling import ContextSpecification, sample_multiple_contexts
+
+context_specifications = [
+    ContextSpecification(max_num_samples=511, max_token_length=32768, seed=0),
+    ContextSpecification(max_num_samples=511, max_token_length=32768, seed=1),
+    ContextSpecification(max_num_samples=511, max_token_length=32768, seed=2),
+]
+
+contexts, context_id_lists = sample_multiple_contexts(
+    msa_path="my_protein.a3m",
+    context_specifications=context_specifications,
+    seed=0,
+)
+
+# contexts is a list of comma-separated context strings, one per specification
+# context_id_lists is a list of lists of sequence identifiers
+for i, (ctx_str, ctx_ids) in enumerate(zip(contexts, context_id_lists)):
+    print(f"Context {i}: {len(ctx_ids)} homologs sampled")
+    full_input = ctx_str + "," + query_sequence
+    # run inference on full_input ...
+```
+
+<Info>
+  `sample_multiple_contexts` caches the neighbor-count computation (which scales as O(N²) in MSA size) and reuses it across all context draws. This makes ensembling significantly faster than calling `sample_context` independently for each specification.
+</Info>
+
+## Passing sampled context to E1Predictor
+
+The `context_seqs` argument to `E1Predictor.predict` accepts a dictionary mapping context IDs to context strings. Combine it with `sample_context` like this:
+
+```python
+from E1.msa_sampling import sample_context
+from E1.predictor import E1Predictor
+from E1.modeling import E1ForMaskedLM
+
+model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-300m").to("cuda:0")
+model.eval()
+
+predictor = E1Predictor(model, max_batch_tokens=65536, use_cache=True)
+
+context_str, context_ids = sample_context(
+    msa_path="my_protein.a3m",
+    max_num_samples=511,
+    max_token_length=32768,
+    seed=42,
+)
+
+sequences = ["MFCATEEKL", "MFCATEEKY"]
+
+for prediction in predictor.predict(sequences, context_seqs={"msa_ctx": context_str}):
+    print(prediction["id"], prediction["token_embeddings"].shape)
+```
+
+<Warning>
+  Gap characters (`-`) and lowercase insertions from the A3M alignment are stripped automatically before context sequences are passed to E1. The context string returned by `sample_context` contains only uppercase A–Z residues.
+</Warning>

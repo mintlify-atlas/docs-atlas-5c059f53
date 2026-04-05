@@ -1,0 +1,126 @@
+---
+title: "Zero-shot fitness prediction"
+description: "Score protein variants against a wild-type sequence without fine-tuning."
+---
+
+E1 can rank protein variants by their predicted fitness relative to a wild-type parent using **log-probability ratios**. Because E1 was trained on large protein sequence databases, it encodes evolutionary constraints — mutations that are tolerated by evolution tend to receive higher log-probability, and this correlates with experimental fitness measurements.
+
+No fine-tuning or labelled data is required.
+
+## Scoring methods
+
+`E1Scorer` implements two methods via the `EncoderScoreMethod` enum:
+
+<CardGroup cols={2}>
+  <Card title="WILDTYPE_MARGINAL">
+    Run the **unmasked parent** sequence once through the model. Score each mutant by summing `log P(mutant_aa | parent context) − log P(parent_aa | parent context)` over all mutated positions.
+
+    **Cost:** one forward pass per parent sequence (or per context, if using retrieval-augmented mode).
+
+    **Best for:** fast screening of large mutant libraries when accuracy is less critical.
+  </Card>
+  <Card title="MASKED_MARGINAL">
+    For each mutated position, **mask that position** in the parent and score the mutant amino acid. The score at each position is `log P(mutant_aa | masked context)`.
+
+    **Cost:** one forward pass per unique mutated position across all mutants.
+
+    **Best for:** more accurate fitness ranking, especially when mutations alter local context.
+  </Card>
+</CardGroup>
+
+## Basic usage
+
+```python
+import torch
+from E1.modeling import E1ForMaskedLM
+from E1.scorer import E1Scorer, EncoderScoreMethod
+
+model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-300m", dtype=torch.float).to("cuda:0")
+model.eval()
+
+scorer = E1Scorer(model, method=EncoderScoreMethod.MASKED_MARGINAL)
+
+parent_sequence = "MFCATEEKL"
+mutants = ["MFCATEEKV", "MFCATEEKR", "MACATEEKL"]
+
+scores = scorer.score(
+    parent_sequence=parent_sequence,
+    sequences=mutants,
+    sequence_ids=["mut1", "mut2", "mut3"],
+)
+
+for s in scores:
+    print(s["id"], s["score"])
+```
+
+Each entry in the returned list is a dictionary:
+
+| Key | Description |
+|-----|-------------|
+| `id` | Sequence identifier passed via `sequence_ids` |
+| `context_id` | `"mean"` when `context_reduction="mean"` (default), or the context key when `context_reduction="none"` |
+| `score` | Log-probability ratio score (higher = more fit relative to parent) |
+
+## Input constraints
+
+<Warning>
+  - Parent and **all** mutants must be the **same length** — E1 scorer does not handle insertions or deletions.
+  - All sequences must be uppercase A–Z. `X` residues are removed internally before scoring.
+  - Do **not** include mask tokens (`?`) in sequences passed to `E1Scorer`.
+</Warning>
+
+## Retrieval-augmented scoring
+
+Providing homologous context sequences typically improves ranking accuracy, especially for proteins with good MSA coverage.
+
+```python
+scores = scorer.score(
+    parent_sequence=parent_sequence,
+    sequences=mutants,
+    sequence_ids=["mut1", "mut2", "mut3"],
+    context_seqs={"ctx1": "MFCATEEKY", "ctx2": "MCCASDFKL"},
+    context_reduction="mean",
+)
+```
+
+When `context_seqs` is provided:
+- Scoring is performed once for each context sequence.
+- Scores across contexts are aggregated according to `context_reduction`.
+
+## context_reduction parameter
+
+| Value | Behaviour |
+|-------|-----------|
+| `"mean"` (default) | Average log-probabilities across all context sequences before computing the per-mutant score. Returns one score per mutant. |
+| `"none"` | Return a separate score for each `(mutant, context)` pair. Useful for inspecting context-specific predictions or for manual ensembling. |
+
+```python
+# Get per-context scores
+scores = scorer.score(
+    parent_sequence=parent_sequence,
+    sequences=mutants,
+    sequence_ids=["mut1", "mut2", "mut3"],
+    context_seqs={"ctx1": "MFCATEEKY", "ctx2": "MCCASDFKL"},
+    context_reduction="none",
+)
+
+for s in scores:
+    print(s["id"], s["context_id"], s["score"])
+# mut1  ctx1  -0.42
+# mut1  ctx2  -0.31
+# mut2  ctx1   0.15
+# ...
+```
+
+## E1Scorer constructor parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `model` | `E1ForMaskedLM` | — | Loaded model instance |
+| `method` | `EncoderScoreMethod` | — | `WILDTYPE_MARGINAL` or `MASKED_MARGINAL` |
+| `data_prep_config` | `DataPrepConfig \| None` | `None` | Custom tokenisation config; `X` removal is always enabled internally |
+| `max_batch_tokens` | `int` | `65536` | Maximum total tokens per forward pass |
+
+<Info>
+  `E1Scorer` constructs an internal `E1Predictor` with `save_masked_positions_only=True` when using `MASKED_MARGINAL`. This avoids storing full-sequence logit tensors and significantly reduces memory usage for long sequences.
+</Info>

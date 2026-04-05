@@ -1,80 +1,102 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Run your first protein inference with E1 in minutes."
 ---
 
-## Get started in three steps
+<Tip>
+  Use **E1-150m** for quick experimentation and prototyping. Switch to **E1-600m** for production workloads where representation quality matters most. E1-300m is a good all-around choice for balancing speed and accuracy.
+</Tip>
 
-Get your documentation site running locally and make your first customization.
+<Steps>
+  <Step title="Install E1">
+    Clone the repository and install the package with pip:
 
-### Step 1: Set up your local environment
+    ```bash
+    git clone https://github.com/Profluent-AI/E1.git
+    cd E1 && pip3 install -e .
+    ```
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    See [Installation](/installation) for optional dependencies (e.g., `flash-attn` for GPU acceleration) and compute requirements.
+  </Step>
 
-### Step 2: Deploy your changes
+  <Step title="Load the model">
+    Import `E1ForMaskedLM` and load a pretrained checkpoint. Weights are downloaded automatically from HuggingFace on first use.
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    ```python
+    import torch
+    from E1.batch_preparer import E1BatchPreparer
+    from E1.modeling import E1ForMaskedLM
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-300m").to("cuda:0")
+    model.eval()
+    ```
+  </Step>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+  <Step title="Prepare a batch and run inference">
+    Use `E1BatchPreparer` to tokenize and pad your sequences, then run a forward pass under `torch.autocast` for BF16 precision:
 
-### Step 3: Go live
+    ```python
+    sequences = ["AAAAA?C", "MFCATEEKL,MCCASDF,MFCC?SEF"]
+    batch_preparer = E1BatchPreparer()
+    batch = batch_preparer.get_batch_kwargs(sequences, device="cuda:0")
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+        outputs = model(
+            input_ids=batch["input_ids"],
+            within_seq_position_ids=batch["within_seq_position_ids"],
+            global_position_ids=batch["global_position_ids"],
+            sequence_ids=batch["sequence_ids"],
+            past_key_values=None,
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=False,
+        )
+
+    logits: torch.Tensor = outputs.logits  # (B, L, V)
+    embeddings: torch.Tensor = outputs.embeddings  # (B, L, E)
+    ```
+
+    The second sequence, `"MFCATEEKL,MCCASDF,MFCC?SEF"`, demonstrates **retrieval-augmented mode**: homologs (`MFCATEEKL` and `MCCASDF`) are comma-separated prefixes, and the query sequence (`MFCC?SEF`) is the final entry. `?` is the mask token.
+
+    Output shapes:
+    - `logits` — `(B, L, V)`: batch × padded sequence length × vocabulary size
+    - `embeddings` — `(B, L, E)`: batch × padded sequence length × hidden size
+  </Step>
+
+  <Step title="Extract residue-level outputs with selectors">
+    The batch tensors include special boundary tokens (`<bos>`, `<eos>`, `1`, `2`, `<pad>`) and, in retrieval-augmented inputs, context sequences that precede the query. Use boolean selectors to isolate the residues that belong to the query sequence only:
+
+    ```python
+    # last_sequence_selector: True for tokens that are part of the last sequence
+    last_sequence_selector = batch["sequence_ids"] == batch["sequence_ids"].max(dim=1)[0][:, None]
+    # residue_selector: True for tokens that are part of the input sequence (not boundary tokens)
+    residue_selector = ~(batch_preparer.get_boundary_token_mask(batch["input_ids"]))
+    # last_sequence_residue_selector: True for residues in the last sequence (excluding boundary tokens)
+    last_sequence_residue_selector = last_sequence_selector & residue_selector
+
+    # Get embeddings for the query sequences only
+    last_sequence_embeddings = [embeddings[i, last_sequence_residue_selector[i]] for i in range(embeddings.shape[0])]
+    ```
+
+    This yields embeddings for `["AAAAA?C", "MFCC?SEF"]` — the query portions only — discarding boundary tokens and the homolog context in the second input. You can apply the same selector pattern to `logits`.
+
+    Selector summary:
+
+    | Selector | Selects |
+    |----------|---------|
+    | `last_sequence_selector` | All tokens belonging to the last (query) sequence, including its boundary tokens |
+    | `residue_selector` | All tokens that are amino acid residues (excludes `<bos>`, `<eos>`, `1`, `2`, `<pad>`) |
+    | `last_sequence_residue_selector` | Amino acid residues in the query sequence only |
+  </Step>
+</Steps>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Single-sequence inference" icon="dna" href="/guides/single-sequence-inference">
+    Detailed guide to encoding protein sequences and working with embeddings.
+  </Card>
+  <Card title="Retrieval-augmented inference" icon="magnifying-glass" href="/guides/retrieval-augmented-inference">
+    Learn how to format multi-sequence inputs and interpret retrieval-augmented outputs.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

@@ -1,0 +1,138 @@
+---
+title: "Protein embeddings"
+description: "Extract per-residue and sequence-level embeddings using E1."
+---
+
+E1 produces high-quality contextual residue representations that can be used for downstream tasks such as structure prediction, function annotation, homology search, and clustering. The `E1Predictor` class provides a high-level interface that handles batching, KV caching, and output extraction automatically.
+
+## Quick start
+
+```python
+import torch
+from E1.modeling import E1ForMaskedLM
+from E1.predictor import E1Predictor
+
+model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-300m").to("cuda:0")
+model.eval()
+
+predictor = E1Predictor(
+    model,
+    max_batch_tokens=65536,
+    use_cache=True,
+    fields_to_save=["token_embeddings", "mean_token_embeddings"],
+)
+
+sequences = ["MFCATEEKL", "MKLLVVFLLL"]
+for prediction in predictor.predict(sequences, sequence_ids=[0, 1]):
+    seq_id = prediction["id"]
+    token_embeddings = prediction["token_embeddings"]     # (L, E) — per residue
+    mean_embedding = prediction["mean_token_embeddings"]  # (E,)   — sequence level
+    print(f"Sequence {seq_id}: residue shape={token_embeddings.shape}, mean shape={mean_embedding.shape}")
+```
+
+## E1Predictor parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `model` | `E1ForMaskedLM` | — | Loaded model instance |
+| `max_batch_tokens` | `int` | `65536` | Maximum total tokens across all sequences in one forward pass |
+| `use_cache` | `bool` | `True` | Cache context KV states for retrieval-augmented inference |
+| `cache_size` | `int` | `4` | Number of context KV states to keep in memory |
+| `fields_to_save` | `list[str]` | `["logits", "token_embeddings", "mean_token_embeddings"]` | Which output fields to compute and return |
+| `save_masked_positions_only` | `bool` | `False` | Only return outputs at `?`-masked positions |
+| `keep_predictions_in_gpu` | `bool` | `False` | Keep output tensors on GPU instead of moving to CPU |
+
+### fields_to_save options
+
+<CardGroup cols={3}>
+  <Card title="logits">
+    Per-residue log-probability distribution over the amino acid vocabulary. Shape: `(L, V)` where `V` is vocabulary size.
+  </Card>
+  <Card title="token_embeddings">
+    Per-residue contextual embedding from the final transformer layer. Shape: `(L, E)` where `E` is the model hidden size.
+  </Card>
+  <Card title="mean_token_embeddings">
+    Mean-pooled sequence-level embedding. Shape: `(E,)`. Computed as `token_embeddings.mean(dim=0)` over all residue positions.
+  </Card>
+</CardGroup>
+
+Restricting `fields_to_save` to only what you need reduces memory usage during large-scale inference:
+
+```python
+# Only compute sequence-level embeddings — skip logits and per-token embeddings
+predictor = E1Predictor(
+    model,
+    max_batch_tokens=65536,
+    fields_to_save=["mean_token_embeddings"],
+)
+```
+
+## E1Prediction fields
+
+Each item yielded by `predictor.predict(...)` is an `E1Prediction` TypedDict with the following fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `str \| int` | Sequence identifier, from the `sequence_ids` argument |
+| `context_id` | `str \| int \| None` | Context sequence identifier; `None` for single-sequence inference |
+| `logits` | `torch.Tensor` (L, V) | Per-residue logits (only present if `"logits"` in `fields_to_save`) |
+| `token_embeddings` | `torch.Tensor` (L, E) | Per-residue embeddings (only present if `"token_embeddings"` in `fields_to_save`) |
+| `mean_token_embeddings` | `torch.Tensor` (E,) | Mean-pooled sequence embedding (only present if `"mean_token_embeddings"` in `fields_to_save`) |
+
+<Note>
+  `L` in the output tensors is the number of **residues only** — boundary tokens (`<bos>`, `<eos>`, `1`, `2`, `<pad>`) are already stripped. For retrieval-augmented inputs, `L` is the length of the **query** sequence only; context residues are excluded.
+</Note>
+
+## Batching behaviour
+
+`E1Predictor` automatically forms efficient batches respecting `max_batch_tokens`:
+
+1. **Group by context** — sequences sharing the same context string are placed in the same batch to enable KV cache reuse.
+2. **Group by length** — within a context group, sequences are sorted by length and binned so that no batch exceeds `max_batch_tokens` total tokens.
+
+This means you can call `predictor.predict` on thousands of sequences at once and the predictor will handle batching transparently:
+
+```python
+import torch
+from E1.modeling import E1ForMaskedLM
+from E1.predictor import E1Predictor
+
+model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-300m").to("cuda:0")
+model.eval()
+
+predictor = E1Predictor(
+    model,
+    max_batch_tokens=65536,
+    use_cache=True,
+    fields_to_save=["token_embeddings", "mean_token_embeddings"],
+)
+
+# Large list of sequences — automatically batched
+sequences = ["MFCATEEKL", "MKLLVVFLLL", "ACDEFGHIKL", "WQNSTARPVL"]
+sequence_ids = ["prot_A", "prot_B", "prot_C", "prot_D"]
+
+all_embeddings = {}
+for prediction in predictor.predict(sequences, sequence_ids=sequence_ids):
+    all_embeddings[prediction["id"]] = prediction["mean_token_embeddings"]
+
+print(all_embeddings["prot_A"].shape)  # (E,)
+```
+
+## Retrieval-augmented embeddings
+
+Provide `context_seqs` to condition embeddings on homologous sequences. See [Retrieval-augmented inference](/guides/retrieval-augmented-inference) for full details.
+
+```python
+context_seqs = {
+    "homolog_1": "MFCATEEKY",
+    "homolog_2": "MCCASDFKL",
+}
+
+for prediction in predictor.predict(sequences, sequence_ids=sequence_ids, context_seqs=context_seqs):
+    # prediction["context_id"] identifies which homolog was used
+    print(prediction["id"], prediction["context_id"], prediction["mean_token_embeddings"].shape)
+```
+
+<Info>
+  With `use_cache=True`, the KV states for each context sequence are computed once and reused across all queries sharing that context. This significantly reduces compute when scoring many sequences against the same homolog.
+</Info>

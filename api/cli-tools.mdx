@@ -1,0 +1,171 @@
+---
+title: "CLI tools"
+description: "Command-line tools for batch prediction and scoring."
+---
+
+E1 ships two CLI entry points for batch inference and variant scoring. Both are implemented with Click and can be invoked via `python -m`.
+
+---
+
+## `E1.tools.predict`
+
+Runs batch embedding and logit extraction over a FASTA file and writes one `.safetensors` file per sequence to an output directory.
+
+```bash
+python -m E1.tools.predict \
+  --model-name  <MODEL> \
+  --input-path  <INPUT.fasta> \
+  [options]
+```
+
+### Options
+
+<ParamField path="--model-name" type="string" required>
+  HuggingFace Hub model ID (e.g. `"Profluent-Bio/E1-300m"`) or an absolute path to a local checkpoint directory.
+</ParamField>
+
+<ParamField path="--input-path" type="string" required>
+  Path to the input FASTA file. Each record becomes one prediction. Multi-sequence inputs can be encoded by placing comma-separated sequences in a single record (context sequences first, query last).
+</ParamField>
+
+<ParamField path="--output-dir" type="string" default='"predictions"'>
+  Directory where `.safetensors` output files are written. One file per prediction, named `<id>.safetensors` (or `<context_id>+<id>.safetensors` when context is present). The directory must exist before running.
+</ParamField>
+
+<ParamField path="--context-path" type="string" default="None">
+  Optional path to a FASTA file of context (retrieval) sequences. When provided, every query sequence is evaluated once per context record; the output filename encodes both IDs.
+</ParamField>
+
+<ParamField path="--max-batch-tokens" type="integer" default="65536">
+  Maximum total token count per forward pass. Reduce this value if you encounter GPU out-of-memory errors.
+</ParamField>
+
+<ParamField path="--save-masked-positions-only" type="boolean" default="false">
+  When `true`, logits and embeddings are saved only at `?` mask positions. Reduces output file sizes for masked-inference workflows.
+</ParamField>
+
+<ParamField path="--fields-to-save" type="string[]" default='["logits","token_embeddings","mean_token_embeddings"]'>
+  Comma-separated list of fields to include in each `.safetensors` file. Valid values: `logits`, `token_embeddings`, `mean_token_embeddings`.
+</ParamField>
+
+### Output format
+
+Each `.safetensors` file contains the requested tensors plus metadata:
+
+| Key | Shape | Description |
+|---|---|---|
+| `logits` | `(L, V)` | Per-residue vocabulary logits |
+| `token_embeddings` | `(L, E)` | Per-residue hidden states |
+| `mean_token_embeddings` | `(E,)` | Mean over residue dimension |
+
+Metadata fields: `id` (sequence identifier), `context_id` (context identifier or empty string).
+
+### Examples
+
+```bash
+# Basic: extract embeddings for all sequences in sequences.fasta
+python -m E1.tools.predict \
+  --model-name Profluent-Bio/E1-300m \
+  --input-path sequences.fasta \
+  --output-dir ./embeddings
+
+# Save only mean embeddings to reduce disk usage
+python -m E1.tools.predict \
+  --model-name Profluent-Bio/E1-300m \
+  --input-path sequences.fasta \
+  --output-dir ./embeddings \
+  --fields-to-save '["mean_token_embeddings"]'
+
+# Retrieval-augmented prediction with context
+python -m E1.tools.predict \
+  --model-name Profluent-Bio/E1-300m \
+  --input-path queries.fasta \
+  --context-path homologs.fasta \
+  --output-dir ./ra_embeddings \
+  --max-batch-tokens 32768
+```
+
+---
+
+## `E1.tools.score`
+
+Scores a set of mutant sequences against a single parent sequence and writes results to a CSV file.
+
+```bash
+python -m E1.tools.score \
+  --model-name   <MODEL> \
+  --mutants-path <MUTANTS.fasta> \
+  --parent-path  <PARENT.fasta> \
+  --output-path  <scores.csv> \
+  [options]
+```
+
+### Options
+
+<ParamField path="--model-name" type="string" required>
+  HuggingFace Hub model ID or local checkpoint path.
+</ParamField>
+
+<ParamField path="--mutants-path" type="string" required>
+  Path to a FASTA file containing mutant (variant) sequences. All sequences must be the same length as the parent sequence and must not contain `X` residues.
+</ParamField>
+
+<ParamField path="--parent-path" type="string" required>
+  Path to a FASTA file containing exactly one sequence: the wild-type (parent) reference.
+</ParamField>
+
+<ParamField path="--output-path" type="string" required>
+  Path for the output CSV file. Columns: `id`, `context_id`, `score`.
+</ParamField>
+
+<ParamField path="--context-path" type="string" default="None">
+  Optional FASTA file of retrieval-context homologs. All context sequences are used together; use `--context-reduction` to control aggregation.
+</ParamField>
+
+<ParamField path="--max-batch-tokens" type="integer" default="65536">
+  Maximum total token count per forward pass.
+</ParamField>
+
+<ParamField path="--scoring-method" type="string" default='"masked_marginal"'>
+  Scoring strategy. Choices: `masked_marginal` (one forward pass per mutated position, more accurate) or `wildtype_marginal` (single forward pass on the parent, faster). See [`EncoderScoreMethod`](/api/e1-scorer) for details.
+</ParamField>
+
+<ParamField path="--context-reduction" type="string" default='"mean"'>
+  How to aggregate scores across multiple context sequences. `"mean"` produces one row per variant; `"none"` produces one row per variant × context pair.
+</ParamField>
+
+### Output CSV columns
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | string / integer | Sequence identifier from the FASTA record |
+| `context_id` | string | `"mean"` (default) or per-context ID when `--context-reduction none` |
+| `score` | float | Sum of per-position log-likelihood ratios relative to the parent |
+
+### Examples
+
+```bash
+# Masked-marginal scoring (default, most accurate)
+python -m E1.tools.score \
+  --model-name    Profluent-Bio/E1-300m \
+  --mutants-path  variants.fasta \
+  --parent-path   wildtype.fasta \
+  --output-path   scores.csv
+
+# Wildtype-marginal scoring (faster for large variant libraries)
+python -m E1.tools.score \
+  --model-name      Profluent-Bio/E1-300m \
+  --mutants-path    variants.fasta \
+  --parent-path     wildtype.fasta \
+  --output-path     scores_wt.csv \
+  --scoring-method  wildtype_marginal
+
+# Retrieval-augmented scoring with per-context scores
+python -m E1.tools.score \
+  --model-name        Profluent-Bio/E1-300m \
+  --mutants-path      variants.fasta \
+  --parent-path       wildtype.fasta \
+  --context-path      homologs.fasta \
+  --output-path       scores_ra.csv \
+  --context-reduction none
+```

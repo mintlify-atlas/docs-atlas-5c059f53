@@ -1,0 +1,134 @@
+---
+title: "Site saturation mutagenesis"
+description: "Score all possible single amino acid substitutions across your protein."
+---
+
+In-silico site saturation mutagenesis (SSM) scores every possible single amino acid substitution at every position in a protein. For a protein of length L, this produces an L × 20 score matrix that can guide library design, highlight functionally important residues, and predict the impact of unknown variants.
+
+## Workflow
+
+<Steps>
+  <Step title="Load the model and scorer">
+    ```python
+    import torch
+    from E1.modeling import E1ForMaskedLM
+    from E1.scorer import E1Scorer, EncoderScoreMethod
+
+    model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-300m", dtype=torch.float).to("cuda:0")
+    model.eval()
+
+    scorer = E1Scorer(model, method=EncoderScoreMethod.MASKED_MARGINAL)
+    ```
+  </Step>
+
+  <Step title="Generate all single mutants">
+    Enumerate every position × amino acid combination, skipping wild-type identities:
+
+    ```python
+    parent = "MFCATEEKL"
+    amino_acids = list("ACDEFGHIKLMNPQRSTVWY")
+
+    mutants = []
+    mutant_ids = []
+    for pos in range(len(parent)):
+        for aa in amino_acids:
+            if aa != parent[pos]:
+                mutant = parent[:pos] + aa + parent[pos + 1:]
+                mutants.append(mutant)
+                mutant_ids.append(f"{parent[pos]}{pos + 1}{aa}")
+    ```
+
+    For a 9-residue protein this produces 9 × 19 = 171 mutants. For a 300-residue protein: 300 × 19 = 5 700 mutants.
+  </Step>
+
+  <Step title="Score all mutants">
+    ```python
+    scores = scorer.score(
+        parent_sequence=parent,
+        sequences=mutants,
+        sequence_ids=mutant_ids,
+    )
+
+    for s in scores:
+        print(s["id"], s["score"])
+    # M1A  -1.23
+    # M1C  -0.87
+    # ...
+    ```
+  </Step>
+
+  <Step title="Build the score matrix">
+    Reshape the scores into an L × 20 matrix for visualisation or downstream analysis:
+
+    ```python
+    import numpy as np
+
+    score_matrix = np.zeros((len(parent), len(amino_acids)))
+    id_to_score = {s["id"]: s["score"] for s in scores}
+
+    for pos_idx, wt_aa in enumerate(parent):
+        for aa_idx, aa in enumerate(amino_acids):
+            if aa != wt_aa:
+                mut_id = f"{wt_aa}{pos_idx + 1}{aa}"
+                score_matrix[pos_idx, aa_idx] = id_to_score.get(mut_id, 0.0)
+            # Wild-type positions remain 0.0 by convention
+    ```
+  </Step>
+</Steps>
+
+## Efficiency of MASKED_MARGINAL for SSM
+
+<Tip>
+  Use `MASKED_MARGINAL` for SSM. With `WILDTYPE_MARGINAL`, all 19 × L mutant scores are derived from a **single** forward pass on the unmasked parent — fast, but less accurate. With `MASKED_MARGINAL`, `E1Scorer` groups mutants by their mutated position and runs **one forward pass per unique mutated position** (not one per mutant), so the cost scales with L rather than L × 19. For large libraries this is a significant saving.
+</Tip>
+
+| Method | Forward passes for SSM | Accuracy |
+|--------|------------------------|----------|
+| `WILDTYPE_MARGINAL` | 1 (single parent pass) | Good |
+| `MASKED_MARGINAL` | L (one per position) | Better |
+
+## Retrieval-augmented SSM
+
+Conditioning on homologous sequences typically improves the correlation between predicted and experimental fitness. The API is identical — just add `context_seqs`:
+
+```python
+scores = scorer.score(
+    parent_sequence=parent,
+    sequences=mutants,
+    sequence_ids=mutant_ids,
+    context_seqs={"ctx1": "MFCATEEKY", "ctx2": "MCCASDFKL"},
+    context_reduction="mean",
+)
+```
+
+With `use_cache=True` inside the scorer's predictor, context KV states are computed once and reused across all masked-parent forward passes, keeping the per-context overhead minimal.
+
+To obtain per-context score matrices (useful for ensembling or uncertainty estimation), set `context_reduction="none"`:
+
+```python
+scores = scorer.score(
+    parent_sequence=parent,
+    sequences=mutants,
+    sequence_ids=mutant_ids,
+    context_seqs={"ctx1": "MFCATEEKY", "ctx2": "MCCASDFKL"},
+    context_reduction="none",
+)
+
+# Each (mutant, context) pair has its own score entry
+for s in scores:
+    print(s["id"], s["context_id"], s["score"])
+```
+
+## Input constraints
+
+<Warning>
+  - All mutants must be the **same length** as the parent. E1Scorer does not support insertions or deletions.
+  - Sequences must be uppercase A–Z. `X` residues are removed internally.
+  - Do **not** include `?` mask tokens in sequences passed to `E1Scorer`.
+</Warning>
+
+## Interpreting the scores
+
+Scores are **log-probability ratios** relative to the wild-type parent: `log P(mutant_aa | context) − log P(parent_aa | context)`. A positive score suggests the model considers the substitution more probable than the wild type in the given evolutionary context; a negative score suggests it is less probable.
+
+These scores correlate with experimentally measured fitness effects (e.g. DMS assay Spearman ρ) without any task-specific fine-tuning. See the [E1 preprint](https://www.biorxiv.org/content/10.1101/2025.11.12.688125v1) for benchmark results on Protein Gym substitution assays.

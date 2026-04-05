@@ -1,0 +1,182 @@
+---
+title: "Model architecture"
+description: "Technical overview of the E1 protein encoder architecture."
+---
+
+E1 is a decoder-style transformer trained with a masked language modeling (MLM) objective on protein sequences. The architecture combines grouped-query attention, dual rotary positional embeddings, and a block-causal attention mask that enables multi-sequence (retrieval-augmented) inputs in a single forward pass.
+
+## Model variants
+
+Three model sizes are available on Hugging Face:
+
+| Model | Parameters | Hugging Face |
+|-------|-----------|--------------|
+| E1-150m | 150M | `Profluent-Bio/E1-150m` |
+| E1-300m | 300M | `Profluent-Bio/E1-300m` |
+| E1-600m | 600M | `Profluent-Bio/E1-600m` |
+
+All three variants share the same architectural design and differ only in the depth and width of the transformer stack.
+
+## High-level structure
+
+E1 exposes two top-level classes:
+
+- **`E1Model`** — the core transformer backbone. Produces contextual hidden states.
+- **`E1ForMaskedLM`** — wraps `E1Model` with an MLM head for masked amino-acid prediction and embedding extraction.
+
+```
+E1ForMaskedLM
+└── E1Model
+    ├── embed_tokens          # token embeddings  (vocab_size × hidden_size)
+    ├── embed_seq_id          # sequence-ID embeddings (max_num_sequences × hidden_size)
+    ├── layers[0..N-1]        # stack of DecoderLayer
+    └── norm                  # final RMSNorm
+└── mlm_head
+    ├── Linear(hidden_size → hidden_size)
+    ├── GELU
+    ├── LayerNorm
+    └── Linear(hidden_size → vocab_size)
+```
+
+### Input embeddings
+
+At the start of every forward pass, the input representation is formed by **summing** two embedding lookups:
+
+1. **Token embeddings** (`embed_tokens`) — one vector per vocabulary token.
+2. **Sequence-ID embeddings** (`embed_seq_id`) — one learned vector per sequence slot in the multi-sequence input (i.e., which homolog index the token belongs to).
+
+This gives the model a direct, learned signal about which sequence each token originates from before any attention layers are applied.
+
+## DecoderLayer
+
+Each layer in the transformer stack is a `DecoderLayer` implementing a pre-norm architecture:
+
+```
+DecoderLayer
+├── NormAttentionNorm
+│   ├── input_layernorm           (RMSNorm)
+│   ├── Attention
+│   └── post_attention_layernorm  (RMSNorm)
+└── FFN (feed-forward network)
+```
+
+The residual connections follow this pattern:
+
+```python
+# Inside NormAttentionNorm
+residual = hidden_states
+hidden_states = input_layernorm(hidden_states)
+hidden_states, _, _ = Attention(hidden_states, ...)
+hidden_states = residual + hidden_states          # first residual add
+
+residual = hidden_states
+hidden_states = post_attention_layernorm(hidden_states)
+# hidden_states is passed to the FFN in DecoderLayer
+
+# Back in DecoderLayer
+hidden_states = FFN(hidden_states)
+hidden_states = residual + hidden_states          # second residual add
+```
+
+### Attention
+
+Attention uses **grouped-query attention (GQA)**: queries use `num_attention_heads` heads while keys and values share `num_key_value_heads` heads. The default configuration has 32 query heads and 8 key-value heads (a 4× sharing ratio), reducing KV memory bandwidth during inference.
+
+Projection matrices:
+
+| Projection | Shape |
+|------------|-------|
+| `q_proj` | `hidden_size → num_attention_heads × head_dim` |
+| `k_proj` | `hidden_size → num_key_value_heads × head_dim` |
+| `v_proj` | `hidden_size → num_key_value_heads × head_dim` |
+| `o_proj` | `num_attention_heads × head_dim → hidden_size` |
+
+All projection matrices are bias-free. An optional `clip_qkv` threshold can clamp QKV activations before the attention computation.
+
+The attention backend is selected per-layer:
+
+- **Within-sequence layers** (`AttentionLayerType.WITHIN_SEQ`) use Flash Attention (bidirectional within each sequence's token span), falling back to variable-length FlexAttention if Flash Attention is unavailable.
+- **Global layers** (`AttentionLayerType.GLOBAL`, enabled via `global_attention_every_n_layers`) use FlexAttention with the block-causal mask during the prefill pass, then switch to bidirectional Flash Attention once the KV cache is filled.
+
+### Feed-forward network
+
+The FFN supports two variants controlled by `gated_mlp` in the config:
+
+- **Standard MLP** (`gated_mlp=False`, default): `hidden → intermediate` linear with SiLU activation, followed by `intermediate → hidden`.
+- **Gated MLP / SwiGLU** (`gated_mlp=True`): two parallel `hidden → intermediate` projections; the first is activated with SiLU and element-wise multiplied by the second, then projected back to `hidden`.
+
+When `intermediate_size` is not set explicitly, the config defaults to `4 × hidden_size` for the standard MLP and `3 × hidden_size` for the gated variant.
+
+### RMSNorm
+
+All layer normalization uses `RMSNorm` with a learned per-dimension scale (`weight`) and no bias. The implementation uses the Triton fused kernel from `kernels-community/triton-layer-norm` when available, falling back to `torch.nn.functional.rms_norm` otherwise. The epsilon is `1e-5` by default.
+
+## Dual rotary positional embeddings
+
+<Note>
+E1 applies **two independent RoPE encodings** depending on the layer type. Within-sequence layers encode the position of each token *within* its own protein sequence; global layers encode the position of each token *across* the entire concatenated input. The two encodings use different base frequencies and different position-ID streams, letting the model capture both local residue-level context and global multi-sequence ordering simultaneously.
+</Note>
+
+| Parameter | Within-sequence layers | Global layers |
+|-----------|----------------------|---------------|
+| `rope_theta` | `10000.0` | `100000.0` |
+| `max_position_embeddings` | `max_num_positions_within_seq` (8192) | `max_num_positions_global` (131072) |
+| Position IDs used | `within_seq_position_ids` | `global_position_ids` |
+
+The higher base frequency for global RoPE (`100000.0` vs `10000.0`) extends the effective positional range to accommodate the much larger global token budget (`131072` positions vs `8192`).
+
+## Block-causal attention mask
+
+For multi-sequence inputs, E1 builds a **block-causal mask** via `create_block_causal_mask_optimized` using PyTorch FlexAttention. The masking rule is:
+
+> Token at query position `q` may attend to token at key position `kv` if and only if `sequence_id[q] >= sequence_id[kv]`, and neither token is a padding token (`sequence_id != -1`).
+
+This means:
+
+- Each homolog attends to itself and all earlier homologs.
+- The query sequence (last, with the highest `sequence_id`) attends to all homologs and itself.
+- Homologs do **not** attend to the query, preventing information leakage from the target into the context.
+
+The mask is computed once before the layer loop and passed through all layers as part of `FlexAttentionArgs`.
+
+## Architectural hyperparameters (defaults)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `hidden_size` | `4096` | Transformer hidden dimension |
+| `intermediate_size` | `16384` | FFN intermediate dimension |
+| `num_hidden_layers` | `40` | Number of `DecoderLayer` blocks |
+| `num_attention_heads` | `32` | Query heads per attention layer |
+| `num_key_value_heads` | `8` | Key/value heads per layer (GQA) |
+| `hidden_act` | `"silu"` | Activation function |
+| `rms_norm_eps` | `1e-5` | Epsilon for RMSNorm stability |
+| `torch_dtype` | `"bfloat16"` | Default compute dtype |
+| `max_num_sequences` | `512` | Maximum sequences per input (context + query) |
+| `max_num_positions_within_seq` | `8192` | Max token positions within a single sequence |
+| `max_num_positions_global` | `131072` | Max token positions across the full input (`1024 × 128`) |
+| `rope_theta_within_seq` | `10000.0` | RoPE base frequency for within-sequence layers |
+| `rope_theta_global` | `100000.0` | RoPE base frequency for global layers |
+| `initializer_range` | `0.02` | Std dev for weight initialization |
+
+## Gradient checkpointing
+
+`E1PreTrainedModel` sets `supports_gradient_checkpointing = True`. Enable it by passing `gradient_checkpointing=True` to `E1Config` or by calling `model.gradient_checkpointing_enable({"use_reentrant": False})` after loading.
+
+<Tip>
+Gradient checkpointing trades compute for memory by recomputing activations during the backward pass instead of storing them. Note that `use_cache=True` is incompatible with gradient checkpointing — the model automatically disables the KV cache when checkpointing is active during training. Set `no_ffn_gradient_checkpointing=True` to checkpoint only attention layers and keep FFN activations in memory, which reduces overhead while still lowering peak memory usage.
+</Tip>
+
+## MLM head
+
+`E1ForMaskedLM` appends a four-module MLM head on top of `E1Model`:
+
+```python
+mlm_head = nn.Sequential(
+    nn.Linear(hidden_size, hidden_size, bias=True),
+    nn.GELU(),
+    nn.LayerNorm(hidden_size, eps=rms_norm_eps),
+    nn.Linear(hidden_size, vocab_size, bias=True),
+)
+```
+
+The head maps each hidden state to a per-token log-probability distribution over the vocabulary. Training loss is cross-entropy computed only over non-padding positions. The `forward` method of `E1ForMaskedLM` returns both `logits` (shape `[batch, seq_len, vocab_size]`) and `embeddings` (the raw last hidden states from `E1Model`, shape `[batch, seq_len, hidden_size]`).

@@ -1,0 +1,209 @@
+---
+title: "E1Predictor"
+description: "High-level batch inference class for embeddings and logits."
+---
+
+`E1Predictor` wraps `E1ForMaskedLM` and handles all batching, KV-cache management, and output extraction. Given a list of amino-acid strings it yields `E1Prediction` dicts containing per-token logits, token embeddings, and/or mean embeddings.
+
+## `E1Prediction`
+
+```python
+class E1Prediction(TypedDict, total=False):
+    id: str | int
+    context_id: str | int | None
+    logits: torch.Tensor
+    token_embeddings: torch.Tensor
+    mean_token_embeddings: torch.Tensor
+```
+
+<ResponseField name="id" type="string | integer">
+  Identifier of the query sequence, sourced from `sequence_ids` passed to `predict()`.
+</ResponseField>
+
+<ResponseField name="context_id" type="string | integer | None">
+  Identifier of the context sequence used for this prediction, or `None` when no context was provided.
+</ResponseField>
+
+<ResponseField name="logits" type="torch.Tensor">
+  Per-residue log-unnormalised vocabulary scores, shape `(num_residues, vocab_size)`. Only amino-acid positions are included (boundary tokens are excluded). Present only when `"logits"` is in `fields_to_save`.
+</ResponseField>
+
+<ResponseField name="token_embeddings" type="torch.Tensor">
+  Per-residue hidden states from the last transformer layer, shape `(num_residues, hidden_size)`. Present only when `"token_embeddings"` is in `fields_to_save`.
+</ResponseField>
+
+<ResponseField name="mean_token_embeddings" type="torch.Tensor">
+  Mean of `token_embeddings` over the residue dimension, shape `(hidden_size,)`. Present only when `"mean_token_embeddings"` is in `fields_to_save`.
+</ResponseField>
+
+---
+
+## Constructor
+
+```python
+class E1Predictor:
+    def __init__(
+        self,
+        model: E1ForMaskedLM,
+        data_prep_config: DataPrepConfig | None = None,
+        max_batch_tokens: int = 65536,
+        use_cache: bool = True,
+        cache_size: int = 4,
+        save_masked_positions_only: bool = False,
+        fields_to_save: list[str] = ["logits", "token_embeddings", "mean_token_embeddings"],
+        keep_predictions_in_gpu: bool = False,
+    ) -> None
+```
+
+<ParamField path="model" type="E1ForMaskedLM" required>
+  An `E1ForMaskedLM` instance. The predictor calls `model.eval()` during construction.
+</ParamField>
+
+<ParamField path="data_prep_config" type="DataPrepConfig" default="None">
+  Tokenization constraints forwarded to `E1BatchPreparer`. Defaults to `DataPrepConfig()`.
+</ParamField>
+
+<ParamField path="max_batch_tokens" type="integer" default="65536">
+  Maximum total token count per forward pass. Sequences are grouped so that `len(sequence) × batch_size ≤ max_batch_tokens`.
+</ParamField>
+
+<ParamField path="use_cache" type="boolean" default="true">
+  When `True`, a `KVCache` of size `cache_size` is used. Context sequences are computed once and reused across all query sequences that share the same context.
+</ParamField>
+
+<ParamField path="cache_size" type="integer" default="4">
+  Number of distinct context states stored in the KV-cache. Ignored when `use_cache=False`.
+</ParamField>
+
+<ParamField path="save_masked_positions_only" type="boolean" default="false">
+  When `True`, logits and embeddings are saved only at `?` mask positions. Useful for masked-marginal scoring.
+</ParamField>
+
+<ParamField path="fields_to_save" type="string[]" default='["logits", "token_embeddings", "mean_token_embeddings"]'>
+  Which output fields to populate in each `E1Prediction`. Any subset of `"logits"`, `"token_embeddings"`, `"mean_token_embeddings"`.
+</ParamField>
+
+<ParamField path="keep_predictions_in_gpu" type="boolean" default="false">
+  When `False` (default), tensors in each `E1Prediction` are moved to CPU before yielding. Set to `True` to keep them on GPU for downstream GPU computations.
+</ParamField>
+
+---
+
+## Methods
+
+### `predict`
+
+```python
+@torch.no_grad()
+def predict(
+    sequences: Sequence[str],
+    sequence_ids: Sequence[int | str] | None = None,
+    context_seqs: dict[str, str] | None = None,
+) -> Iterator[E1Prediction]
+```
+
+Main entry point. Lazily yields one `E1Prediction` per sequence (or per sequence × context combination when `context_seqs` is provided).
+
+<ParamField path="sequences" type="Sequence[string]" required>
+  Amino-acid strings to run inference on. May contain `?` mask characters.
+</ParamField>
+
+<ParamField path="sequence_ids" type="Sequence[integer | string]" default="None">
+  Optional identifiers for each sequence. Defaults to `0, 1, 2, …` when `None`.
+</ParamField>
+
+<ParamField path="context_seqs" type="dict[string, string]" default="None">
+  Retrieval context dictionary mapping context ID to context sequence. When provided, every query sequence is evaluated once per context entry; each resulting `E1Prediction` carries the corresponding `context_id`.
+</ParamField>
+
+**Returns** an `Iterator[E1Prediction]`. Results are not guaranteed to be in input order.
+
+---
+
+### `predict_batch`
+
+```python
+@torch.no_grad()
+def predict_batch(
+    sequences: list[str],
+    sequence_metadata: list[dict[str, str | int]],
+) -> list[E1Prediction]
+```
+
+Runs inference on a pre-batched list of sequences and returns predictions for the last (query) sequence in each multi-sequence input.
+
+<ParamField path="sequences" type="list[string]" required>
+  Batch of amino-acid strings (may be multi-sequence `"CTX,QUERY"` format).
+</ParamField>
+
+<ParamField path="sequence_metadata" type="list[dict]" required>
+  One metadata dict per sequence. Each dict must contain an `"id"` key and may contain `"context_id"`.
+</ParamField>
+
+**Returns** `list[E1Prediction]` in the same order as `sequences`.
+
+---
+
+### `predict_batch_padded`
+
+```python
+@torch.no_grad()
+def predict_batch_padded(sequences: list[str]) -> dict[str, torch.Tensor]
+```
+
+Low-level method that runs a single padded forward pass and returns raw model outputs with auxiliary masks.
+
+<ParamField path="sequences" type="list[string]" required>
+  Batch of amino-acid strings.
+</ParamField>
+
+**Returns** a `dict` with the following keys:
+
+| Key | Type | Description |
+|---|---|---|
+| `logits` | `torch.FloatTensor (B, L, V)` | Vocabulary logits for all tokens |
+| `embeddings` | `torch.FloatTensor (B, L, E)` | Hidden states for all tokens |
+| `last_sequence_mask` | `torch.BoolTensor (B, L)` | `True` at tokens belonging to the last packed sequence |
+| `non_boundary_token_mask` | `torch.BoolTensor (B, L)` | `True` at amino-acid residue positions (excludes `<bos>`, `<eos>`, `1`, `2`, `<pad>`) |
+| `mask_positions_mask` | `torch.BoolTensor (B, L)` | `True` at `?` mask positions |
+| `valid_token_mask` | `torch.BoolTensor (B, L)` | `True` at all non-padding positions |
+
+---
+
+## Usage example
+
+```python
+import torch
+from E1.modeling import E1ForMaskedLM
+from E1.predictor import E1Predictor
+
+model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-300m").to("cuda:0")
+model.eval()
+
+predictor = E1Predictor(
+    model,
+    max_batch_tokens=65536,
+    fields_to_save=["logits", "mean_token_embeddings"],
+)
+
+sequences = ["MKTIIALSYIFCLVFA", "ACDEFGHIKLMNPQRSTVWY"]
+sequence_ids = ["seq_A", "seq_B"]
+
+for prediction in predictor.predict(sequences, sequence_ids=sequence_ids):
+    print(prediction["id"], prediction["mean_token_embeddings"].shape)
+    # seq_A  torch.Size([4096])
+    # seq_B  torch.Size([4096])
+```
+
+### With retrieval context
+
+```python
+context_seqs = {
+    "ctx_1": "MKTIIALSYIFCLVFA",
+    "ctx_2": "ACDEFGHIKLMNPQRSTVWY",
+}
+
+for prediction in predictor.predict(["MKTII"], context_seqs=context_seqs):
+    # yields two E1Prediction objects, one per context
+    print(prediction["id"], prediction["context_id"])
+```

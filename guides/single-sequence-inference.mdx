@@ -1,0 +1,200 @@
+---
+title: "Single-sequence inference"
+description: "Encode a protein sequence to get per-residue logits and embeddings."
+---
+
+E1 is a masked protein language model. Given a sequence of amino acids, a single forward pass produces per-residue log-probability distributions and contextual embeddings. These outputs are the building blocks for downstream tasks such as fitness prediction, embedding analysis, and zero-shot variant scoring.
+
+## Installation
+
+```bash
+git clone https://github.com/Profluent-AI/E1.git
+cd E1 && pip3 install -e .
+```
+
+For GPUs with CUDA capability 8.0 or higher (Ampere or later), also install `flash-attn` to enable flash attention and improve throughput:
+
+```bash
+pip3 install flash-attn --no-build-isolation
+```
+
+## Available models
+
+| Model | Parameters | HuggingFace |
+|-------|-----------|-------------|
+| E1-150m | 150M | `Profluent-Bio/E1-150m` |
+| E1-300m | 300M | `Profluent-Bio/E1-300m` |
+| E1-600m | 600M | `Profluent-Bio/E1-600m` |
+
+## Complete workflow
+
+<Steps>
+  <Step title="Load the model">
+    Download weights from HuggingFace and move the model to your GPU.
+
+    ```python
+    import torch
+    from E1.modeling import E1ForMaskedLM
+
+    model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-300m").to("cuda:0")
+    model.eval()
+    ```
+
+    <Note>
+      The model was trained in BF16 precision. For best performance use a GPU with BF16 support (CUDA capability ≥ 8.0, e.g. A100, H100, L40).
+    </Note>
+  </Step>
+
+  <Step title="Prepare a batch">
+    `E1BatchPreparer` tokenises sequences, constructs position IDs, and pads the batch to a uniform length.
+
+    ```python
+    from E1.batch_preparer import E1BatchPreparer
+
+    sequences = ["AAAAA?C", "MKCATEEKL"]
+    batch_preparer = E1BatchPreparer()
+    batch = batch_preparer.get_batch_kwargs(sequences, device="cuda:0")
+    ```
+
+    The returned `batch` dictionary contains:
+    - `input_ids` — token IDs including `<bos>`, `<eos>`, and boundary tokens
+    - `within_seq_position_ids` — position of each token within its own sequence
+    - `global_position_ids` — position of each token in the full packed sequence
+    - `sequence_ids` — which sequence each token belongs to (0-indexed)
+
+    **Input constraints**
+    - Sequences must be uppercase A–Z.
+    - Use `?` as the mask token for positions whose identity you want the model to predict.
+    - Maximum sequence length is 8 192 residues.
+  </Step>
+
+  <Step title="Run a forward pass">
+    Wrap the forward call in `torch.autocast` to use BF16 arithmetic automatically.
+
+    ```python
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+        outputs = model(
+            input_ids=batch["input_ids"],
+            within_seq_position_ids=batch["within_seq_position_ids"],
+            global_position_ids=batch["global_position_ids"],
+            sequence_ids=batch["sequence_ids"],
+            past_key_values=None,
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=False,
+        )
+    ```
+  </Step>
+
+  <Step title="Extract logits and embeddings">
+    ```python
+    logits: torch.Tensor = outputs.logits      # (B, L, V)
+    embeddings: torch.Tensor = outputs.embeddings  # (B, L, E)
+    ```
+
+    `L` is the full padded sequence length including all boundary tokens. Use the selectors in the next step to isolate residue-level outputs.
+  </Step>
+
+  <Step title="Select residue-level outputs">
+    The packed sequence includes boundary tokens (`<bos>`, `<eos>`, `1`, `2`, `<pad>`) that should be excluded from downstream analysis.
+
+    ```python
+    # residue_selector: True for amino-acid tokens only (excludes boundary tokens)
+    residue_selector = ~(batch_preparer.get_boundary_token_mask(batch["input_ids"]))
+
+    # Gather per-residue embeddings for each sequence in the batch
+    residue_embeddings = [
+        embeddings[i, residue_selector[i]]
+        for i in range(embeddings.shape[0])
+    ]
+    ```
+  </Step>
+</Steps>
+
+## Optional outputs
+
+Pass additional flags to the forward call to retrieve intermediate representations.
+
+<Tabs>
+  <Tab title="Hidden states">
+    Set `output_hidden_states=True` to receive the output of every transformer layer:
+
+    ```python
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+        outputs = model(
+            input_ids=batch["input_ids"],
+            within_seq_position_ids=batch["within_seq_position_ids"],
+            global_position_ids=batch["global_position_ids"],
+            sequence_ids=batch["sequence_ids"],
+            past_key_values=None,
+            use_cache=False,
+            output_hidden_states=True,
+        )
+
+    # Tuple of tensors, one per layer (+ initial embedding output)
+    # Each tensor has shape (B, L, hidden_size)
+    hidden_states = outputs.hidden_states
+    ```
+  </Tab>
+  <Tab title="Attention weights">
+    Set `output_attentions=True` to receive per-layer attention weight matrices:
+
+    ```python
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+        outputs = model(
+            input_ids=batch["input_ids"],
+            within_seq_position_ids=batch["within_seq_position_ids"],
+            global_position_ids=batch["global_position_ids"],
+            sequence_ids=batch["sequence_ids"],
+            past_key_values=None,
+            use_cache=False,
+            output_attentions=True,
+        )
+
+    # Tuple of tensors, one per layer
+    # Each tensor has shape (B, num_heads, L, L)
+    attentions = outputs.attentions
+    ```
+  </Tab>
+</Tabs>
+
+## Interpreting outputs
+
+<CardGroup cols={2}>
+  <Card title="logits — (B, L, V)">
+    Log-probability distribution over the amino acid vocabulary at every position. `B` is batch size, `L` is padded sequence length (including boundary tokens), and `V` is vocabulary size. After applying `log_softmax` over the vocabulary dimension, `logits[b, l, v]` is the model's log-probability that position `l` in example `b` is amino acid `v`.
+  </Card>
+  <Card title="embeddings — (B, L, E)">
+    Contextual residue representations from the final transformer layer. `E` is the model's hidden dimension. These are the same tensor as `outputs.hidden_states[-1]` (i.e. `last_hidden_state` from `E1Model`): `embeddings` is simply the `last_hidden_state` exposed on the `E1ForMaskedLM` output for convenience.
+  </Card>
+</CardGroup>
+
+<Note>
+  `outputs.embeddings` and `E1Model`'s `last_hidden_state` are the same tensor. `E1ForMaskedLM` assigns `embeddings = outputs.last_hidden_state` before passing it through the MLM head to compute `logits`.
+</Note>
+
+### Masking positions
+
+Replace any residue with `?` to ask the model to predict that position. The logits at masked positions reflect the model's distribution conditioned on all unmasked context residues.
+
+```python
+# Mask position 5 in a 7-residue sequence
+sequences = ["AAAAA?C"]
+batch = batch_preparer.get_batch_kwargs(sequences, device="cuda:0")
+
+with torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+    outputs = model(
+        input_ids=batch["input_ids"],
+        within_seq_position_ids=batch["within_seq_position_ids"],
+        global_position_ids=batch["global_position_ids"],
+        sequence_ids=batch["sequence_ids"],
+        past_key_values=None,
+        use_cache=False,
+    )
+
+import torch.nn.functional as F
+residue_selector = ~(batch_preparer.get_boundary_token_mask(batch["input_ids"]))
+# logits for "AAAAA?C" — shape (7, V)
+residue_logits = outputs.logits[0, residue_selector[0]]
+probs_at_mask = F.softmax(residue_logits[5], dim=-1)  # distribution at position 5
+```

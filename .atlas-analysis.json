@@ -1,0 +1,102 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "Profluent E1",
+  "projectDescription": "A family of protein language models (150M–600M parameters) for single-sequence and retrieval-augmented protein representation, designed as drop-in replacements for ESM models.",
+  "theme": "luma",
+  "primaryColor": "#81585d",
+  "lightColor": "#2c3036",
+  "darkColor": "#d9d9da",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/single-sequence-inference",
+              "guides/retrieval-augmented-inference",
+              "guides/embeddings",
+              "guides/msa-sampling",
+              "guides/fitness-prediction",
+              "guides/site-saturation-mutagenesis"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/model-architecture",
+              "concepts/tokenization",
+              "concepts/retrieval-augmentation"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core Classes",
+            "pages": [
+              "api/e1-for-masked-lm",
+              "api/e1-batch-preparer",
+              "api/e1-predictor",
+              "api/e1-scorer"
+            ]
+          },
+          {
+            "group": "Configuration & Utilities",
+            "pages": [
+              "api/e1-config",
+              "api/msa-sampling",
+              "api/cli-tools"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Three model sizes: E1-150m, E1-300m, E1-600m (HuggingFace-hosted)",
+    "Single-sequence protein encoding with masked language modeling",
+    "Retrieval-augmented inference using homologous sequences (MSA context)",
+    "Per-residue logits and embeddings output",
+    "Zero-shot fitness prediction for protein variants",
+    "In-silico site saturation mutagenesis via masked-marginal scoring",
+    "Flash attention support for Ampere and newer GPUs (BF16 precision)",
+    "KV-cache for efficient retrieval-augmented prediction",
+    "Drop-in replacement for ESM family of models",
+    "Distributed inference support via PyTorch distributed"
+  ],
+  "publicApiSurface": [
+    "E1ForMaskedLM.from_pretrained(model_name)",
+    "E1ForMaskedLM.forward(input_ids, within_seq_position_ids, global_position_ids, sequence_ids, ...)",
+    "E1BatchPreparer(data_prep_config, tokenizer)",
+    "E1BatchPreparer.get_batch_kwargs(sequences, device)",
+    "E1BatchPreparer.get_boundary_token_mask(tokens)",
+    "E1BatchPreparer.get_mask_positions_mask(tokens)",
+    "E1Predictor(model, max_batch_tokens, use_cache, fields_to_save, ...)",
+    "E1Predictor.predict(sequences, sequence_ids, context_seqs)",
+    "E1Predictor.predict_batch(sequences, sequence_metadata)",
+    "E1Predictor.predict_batch_padded(sequences)",
+    "E1Scorer(model, method, max_batch_tokens)",
+    "E1Scorer.score(parent_sequence, sequences, sequence_ids, context_seqs, context_reduction)",
+    "E1Config(hidden_size, num_hidden_layers, num_attention_heads, ...)",
+    "sample_context(msa_path, max_num_samples, max_token_length, ...)",
+    "sample_multiple_contexts(msa_path, context_specifications, ...)",
+    "EncoderScoreMethod.WILDTYPE_MARGINAL",
+    "EncoderScoreMethod.MASKED_MARGINAL",
+    "DataPrepConfig(max_num_sequences, max_num_positions_within_seq, remove_X_tokens)",
+    "ContextSpecification(max_num_samples, max_token_length, max_query_similarity, ...)",
+    "CLI: python -m E1.tools.predict --model-name --input-path --output-dir ...",
+    "CLI: python -m E1.tools.score --model-name --mutants-path --parent-path --output-path ..."
+  ]
+}

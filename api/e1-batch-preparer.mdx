@@ -1,0 +1,173 @@
+---
+title: "E1BatchPreparer"
+description: "Prepares tokenized batches for E1 model input."
+---
+
+`E1BatchPreparer` converts raw amino-acid strings into the tensors expected by `E1ForMaskedLM.forward`. It handles single and multi-sequence (context + query) inputs, position-ID construction, padding, and optional mask-token handling.
+
+## `DataPrepConfig`
+
+Configuration dataclass that controls tokenization limits.
+
+```python
+@dataclass
+class DataPrepConfig:
+    max_num_sequences: int = 512
+    max_num_positions_within_seq: int = 8192
+    remove_X_tokens: bool = False
+```
+
+<ParamField path="max_num_sequences" type="integer" default="512">
+  Maximum number of sequences that may be packed into a single multi-sequence instance (context sequences + 1 query). Sequences are separated by commas in the input string.
+</ParamField>
+
+<ParamField path="max_num_positions_within_seq" type="integer" default="8192">
+  Maximum length (in residues) of any single sequence. Sequences longer than this raise a `ValueError`.
+</ParamField>
+
+<ParamField path="remove_X_tokens" type="boolean" default="false">
+  When `True`, `X` (unknown amino acid) tokens are removed from the token and position-ID tensors before batching. Used internally by `E1Scorer`.
+</ParamField>
+
+---
+
+## Constructor
+
+```python
+class E1BatchPreparer:
+    def __init__(
+        self,
+        data_prep_config: DataPrepConfig | None = None,
+        tokenizer: Tokenizer | None = None,
+        preserve_context_labels: bool = False,
+        device: torch.device | None = None,
+    ) -> None
+```
+
+<ParamField path="data_prep_config" type="DataPrepConfig" default="DataPrepConfig()">
+  Tokenization constraints. Defaults to a `DataPrepConfig` with library defaults.
+</ParamField>
+
+<ParamField path="tokenizer" type="tokenizers.Tokenizer" default="None">
+  HuggingFace `tokenizers` `Tokenizer` instance. When `None`, the built-in E1 tokenizer is loaded automatically via `get_tokenizer()`.
+</ParamField>
+
+<ParamField path="preserve_context_labels" type="boolean" default="false">
+  When `False` (default), labels for all context sequences in a multi-sequence input are replaced with `pad_token_id` so that loss is only computed over the final query sequence. Set to `True` to compute loss across all sequences.
+</ParamField>
+
+<ParamField path="device" type="torch.device" default="None">
+  Device on which boundary-token ID tensors are allocated. Falls back to the result of `get_device()` (CUDA if available, otherwise CPU).
+</ParamField>
+
+---
+
+## Methods
+
+### `get_batch_kwargs`
+
+```python
+def get_batch_kwargs(
+    sequences: list[str],
+    device: torch.device = torch.device("cpu"),
+    non_blocking: bool = False,
+) -> dict[str, torch.Tensor | list[str] | list[int]]
+```
+
+Tokenizes and pads a list of sequences, returning a dict ready to unpack into `E1ForMaskedLM.forward`.
+
+<ParamField path="sequences" type="list[string]" required>
+  List of amino-acid strings. Multi-sequence instances are expressed as comma-separated strings, e.g. `"CONTEXT1,CONTEXT2,QUERY"`.
+</ParamField>
+
+<ParamField path="device" type="torch.device" default='torch.device("cpu")'>
+  Target device for returned tensors.
+</ParamField>
+
+<ParamField path="non_blocking" type="boolean" default="false">
+  Enables non-blocking `.to(device)` transfers. Only effective when `device.type == "cuda"`.
+</ParamField>
+
+**Returns** a `dict` with the following keys:
+
+| Key | Type | Description |
+|---|---|---|
+| `input_ids` | `torch.LongTensor (B, L)` | Token IDs including `<bos>`, `1`, residues, `2`, `<eos>` |
+| `sequence_ids` | `torch.LongTensor (B, L)` | Per-token sequence index; `-1` for padding |
+| `within_seq_position_ids` | `torch.LongTensor (B, L)` | Position within each individual sequence; `-1` for padding |
+| `global_position_ids` | `torch.LongTensor (B, L)` | Monotone position across all packed sequences; `-1` for padding |
+| `labels` | `torch.LongTensor (B, L)` | Copy of `input_ids` with context positions masked to `pad_token_id` |
+| `context` | `list[str]` | Decoded context portion for each batch element |
+| `context_len` | `list[int]` | Number of tokens belonging to context sequences |
+
+---
+
+### `get_boundary_token_mask`
+
+```python
+def get_boundary_token_mask(tokens: torch.Tensor) -> torch.BoolTensor
+```
+
+<ParamField path="tokens" type="torch.Tensor" required>
+  1-D or N-D token-ID tensor.
+</ParamField>
+
+**Returns** a `torch.BoolTensor` of the same shape. `True` at every position occupied by a boundary token: `<bos>`, `<eos>`, `1`, `2`, or `<pad>`.
+
+---
+
+### `get_mask_positions_mask`
+
+```python
+def get_mask_positions_mask(tokens: torch.Tensor) -> torch.BoolTensor
+```
+
+<ParamField path="tokens" type="torch.Tensor" required>
+  Token-ID tensor.
+</ParamField>
+
+**Returns** a `torch.BoolTensor` that is `True` at every position where the input token is the mask character `?`.
+
+---
+
+### `validate_sequence`
+
+```python
+def validate_sequence(sequence: str) -> bool
+```
+
+<ParamField path="sequence" type="string" required>
+  A single (not comma-separated) amino-acid string, optionally containing `?` mask characters.
+</ParamField>
+
+**Returns** `True` when the sequence consists entirely of uppercase ASCII letters and/or `?` characters. `False` otherwise.
+
+<Note>
+  This method asserts that the argument is a `str`. Passing any other type raises an `AssertionError`.
+</Note>
+
+---
+
+## Usage example
+
+```python
+import torch
+from E1.batch_preparer import DataPrepConfig, E1BatchPreparer
+
+config = DataPrepConfig(max_num_positions_within_seq=512)
+preparer = E1BatchPreparer(data_prep_config=config)
+
+sequences = [
+    "MKTIIALSYIFCLVFA",           # single sequence
+    "ACDEFGHIKLMNPQRSTVWY,MKTII", # context + query
+]
+
+batch = preparer.get_batch_kwargs(sequences, device=torch.device("cuda"))
+
+print(batch["input_ids"].shape)              # (2, L)
+print(batch["within_seq_position_ids"].shape) # (2, L)
+
+# Check which positions are amino-acid residues (not boundary tokens)
+residue_mask = ~preparer.get_boundary_token_mask(batch["input_ids"])
+print(residue_mask.sum())
+```

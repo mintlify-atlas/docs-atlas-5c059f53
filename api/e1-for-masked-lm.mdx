@@ -1,0 +1,154 @@
+---
+title: "E1ForMaskedLM"
+description: "The main model class for masked language modeling and embedding extraction."
+---
+
+`E1ForMaskedLM` is the top-level PyTorch model for Profluent E1. It wraps `E1Model` with an MLM head and exposes `from_pretrained` for loading published checkpoints. During a forward pass it returns per-token logits over the amino-acid vocabulary and the full hidden-state embeddings.
+
+## Class signature
+
+```python
+class E1ForMaskedLM(E1PreTrainedModel):
+    def __init__(self, config: E1Config) -> None
+```
+
+---
+
+## `from_pretrained`
+
+```python
+@classmethod
+def from_pretrained(
+    pretrained_model_name_or_path: str | os.PathLike | None,
+    *args,
+    **kwargs,
+) -> E1PreTrainedModel
+```
+
+Loads model weights from a HuggingFace Hub repository or a local directory. Delegates to the HuggingFace `PreTrainedModel.from_pretrained` implementation.
+
+<ParamField path="pretrained_model_name_or_path" type="string | PathLike | None" required>
+  HuggingFace model ID (e.g. `"Profluent-Bio/E1-300m"`) or an absolute path to a local directory containing `config.json` and weight files.
+</ParamField>
+
+**Returns** an `E1PreTrainedModel` instance with weights loaded and ready for inference.
+
+---
+
+## `forward`
+
+```python
+def forward(
+    input_ids: torch.LongTensor,                      # (B, L)
+    within_seq_position_ids: torch.LongTensor,        # (B, L)
+    global_position_ids: torch.LongTensor,            # (B, L)
+    sequence_ids: torch.LongTensor,                   # (B, L)
+    labels: torch.LongTensor | None = None,           # (B, L)
+    past_key_values: DynamicCache | None = None,
+    use_cache: bool = False,
+    output_attentions: bool = False,
+    output_hidden_states: bool = False,
+) -> E1MaskedLMOutputWithPast
+```
+
+<ParamField path="input_ids" type="torch.LongTensor" required>
+  Token IDs of shape `(batch_size, seq_length)`. Produced by `E1BatchPreparer`.
+</ParamField>
+
+<ParamField path="within_seq_position_ids" type="torch.LongTensor" required>
+  Position of each token within its own sequence, shape `(B, L)`. Padding positions use `-1`.
+
+  Example for two packed sequences `<bos>1ABC2<eos><bos>1DEF2<eos>`:
+  `[0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6]`
+</ParamField>
+
+<ParamField path="global_position_ids" type="torch.LongTensor" required>
+  Monotonically-increasing position of each token across the entire packed input, shape `(B, L)`. Padding positions use `-1`.
+</ParamField>
+
+<ParamField path="sequence_ids" type="torch.LongTensor" required>
+  Integer sequence index for each token, shape `(B, L)`. Used to embed per-sequence identity and to build block-causal attention masks. Padding positions use `-1`.
+</ParamField>
+
+<ParamField path="labels" type="torch.LongTensor" default="None">
+  Ground-truth token IDs for masked-language-model loss, shape `(B, L)`. Positions equal to `pad_token_id` are ignored in the loss. When `None`, no loss is computed.
+</ParamField>
+
+<ParamField path="past_key_values" type="DynamicCache" default="None">
+  Cached key/value states from a previous forward pass. Pass when running incremental inference with `use_cache=True`.
+</ParamField>
+
+<ParamField path="use_cache" type="boolean" default="false">
+  Whether to return and update `past_key_values`. Incompatible with gradient checkpointing during training.
+</ParamField>
+
+<ParamField path="output_attentions" type="boolean" default="false">
+  If `True`, all per-layer attention weight tensors are included in the output.
+</ParamField>
+
+<ParamField path="output_hidden_states" type="boolean" default="false">
+  If `True`, hidden states from every layer (including the embedding layer) are included in the output.
+</ParamField>
+
+### Returns — `E1MaskedLMOutputWithPast`
+
+<ResponseField name="loss" type="torch.FloatTensor | None">
+  Scalar total training loss. `None` when `labels` is not provided.
+</ResponseField>
+
+<ResponseField name="mlm_loss" type="torch.FloatTensor | None">
+  Masked-language-model cross-entropy loss component. `None` when `labels` is not provided.
+</ResponseField>
+
+<ResponseField name="logits" type="torch.FloatTensor">
+  Per-token log-unnormalised scores over the vocabulary, shape `(B, L, V)` where `V` is `vocab_size`. Cast to `float32` before returning.
+</ResponseField>
+
+<ResponseField name="embeddings" type="torch.FloatTensor">
+  Final hidden states (last transformer layer output), shape `(B, L, E)` where `E` is `hidden_size`.
+</ResponseField>
+
+<ResponseField name="past_key_values" type="DynamicCache | None">
+  Updated key/value cache. Populated only when `use_cache=True`.
+</ResponseField>
+
+<ResponseField name="hidden_states" type="tuple[torch.FloatTensor, ...] | None">
+  Tuple of hidden states from every layer. Populated only when `output_hidden_states=True`.
+</ResponseField>
+
+<ResponseField name="attentions" type="tuple[torch.FloatTensor, ...] | None">
+  Tuple of per-layer attention weights. Populated only when `output_attentions=True`.
+</ResponseField>
+
+---
+
+## Usage example
+
+```python
+import torch
+from E1.modeling import E1ForMaskedLM
+from E1.batch_preparer import E1BatchPreparer
+
+# Load model from HuggingFace Hub
+model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-300m").to("cuda:0")
+model.eval()
+
+# Prepare a batch of sequences
+preparer = E1BatchPreparer()
+batch = preparer.get_batch_kwargs(["MKTIIALSYIFCLVFA"], device="cuda:0")
+
+# Run forward pass under bfloat16 autocast
+with torch.no_grad():
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        output = model(
+            input_ids=batch["input_ids"],
+            within_seq_position_ids=batch["within_seq_position_ids"],
+            global_position_ids=batch["global_position_ids"],
+            sequence_ids=batch["sequence_ids"],
+            past_key_values=None,
+            use_cache=False,
+        )
+
+print(output.logits.shape)      # (1, L, V)
+print(output.embeddings.shape)  # (1, L, hidden_size)
+```

@@ -1,0 +1,158 @@
+---
+title: "E1Scorer"
+description: "Zero-shot fitness scoring of protein variants against a wild-type."
+---
+
+`E1Scorer` computes zero-shot log-likelihood scores for a set of mutant sequences relative to a parent (wild-type) sequence. It supports two scoring methods and optional retrieval-augmented context.
+
+## `EncoderScoreMethod`
+
+```python
+class EncoderScoreMethod(str, Enum):
+    WILDTYPE_MARGINAL = "wildtype_marginal"
+    MASKED_MARGINAL   = "masked_marginal"
+```
+
+| Value | Description |
+|---|---|
+| `WILDTYPE_MARGINAL` | Run the parent sequence once (unmasked). For each mutant, score the mutated positions using the parent-sequence logits. Fast: requires only one forward pass regardless of the number of mutations. |
+| `MASKED_MARGINAL` | Run one forward pass per mutated position, masking that position with `?` each time. Uses only the logit at the masked position. Generally more accurate than wildtype marginal for single and few-mutation variants. |
+
+---
+
+## Constructor
+
+```python
+class E1Scorer:
+    def __init__(
+        self,
+        model: E1ForMaskedLM,
+        method: EncoderScoreMethod,
+        data_prep_config: DataPrepConfig | None = None,
+        max_batch_tokens: int = 65536,
+    ) -> None
+```
+
+<ParamField path="model" type="E1ForMaskedLM" required>
+  Loaded `E1ForMaskedLM` instance.
+</ParamField>
+
+<ParamField path="method" type="EncoderScoreMethod" required>
+  Scoring strategy. Use `EncoderScoreMethod.MASKED_MARGINAL` for higher accuracy or `EncoderScoreMethod.WILDTYPE_MARGINAL` for speed when evaluating large numbers of variants.
+</ParamField>
+
+<ParamField path="data_prep_config" type="DataPrepConfig" default="None">
+  Tokenization config. The scorer always forces `remove_X_tokens=True` internally; other settings from the supplied config are respected.
+</ParamField>
+
+<ParamField path="max_batch_tokens" type="integer" default="65536">
+  Maximum total tokens per forward pass, forwarded to the internal `E1Predictor`.
+</ParamField>
+
+---
+
+## `score`
+
+```python
+def score(
+    parent_sequence: str,
+    sequences: Sequence[str],
+    sequence_ids: Sequence[int | str] | None = None,
+    context_seqs: dict[str, str] | None = None,
+    context_reduction: str = "mean",
+) -> list[dict[str, Any]]
+```
+
+Scores each variant in `sequences` against `parent_sequence`.
+
+<ParamField path="parent_sequence" type="string" required>
+  Wild-type (reference) amino-acid string. Must be uppercase A–Z, must not contain `X`, and must have the same length as every sequence in `sequences`.
+</ParamField>
+
+<ParamField path="sequences" type="Sequence[string]" required>
+  Mutant sequences to score. All must be uppercase A–Z (no `X`), all must have the same length as `parent_sequence`.
+</ParamField>
+
+<ParamField path="sequence_ids" type="Sequence[integer | string]" default="None">
+  Identifiers for each sequence in `sequences`. Defaults to `0, 1, 2, …` when `None`.
+</ParamField>
+
+<ParamField path="context_seqs" type="dict[string, string]" default="None">
+  Retrieval-augmented context dictionary mapping context ID → context sequence. When provided, scoring is conditioned on these homologous sequences.
+</ParamField>
+
+<ParamField path="context_reduction" type="string" default='"mean"'>
+  How to aggregate scores across multiple context sequences.
+  - `"mean"` — average log-probabilities over all contexts; each result has `context_id = "mean"`.
+  - `"none"` — return one result per (sequence, context) pair; each result carries the individual `context_id`.
+</ParamField>
+
+### Returns
+
+`list[dict]` — one dict per scored (sequence, context) combination:
+
+<ResponseField name="id" type="string | integer">
+  Identifier of the scored variant, drawn from `sequence_ids`.
+</ResponseField>
+
+<ResponseField name="context_id" type="string | None">
+  `"mean"` when `context_reduction="mean"`. The individual context identifier when `context_reduction="none"`. `None` when no context was supplied.
+</ResponseField>
+
+<ResponseField name="score" type="float">
+  Sum of per-position log-likelihood ratios (mutant vs. parent) at all mutated positions. Higher scores indicate higher predicted fitness relative to the parent.
+</ResponseField>
+
+<Note>
+  The scorer asserts that parent and mutant sequences are equal length and contain no `X` residues. Violating these constraints raises an `AssertionError`.
+</Note>
+
+---
+
+## Usage example
+
+```python
+import torch
+from E1.modeling import E1ForMaskedLM
+from E1.scorer import E1Scorer, EncoderScoreMethod
+
+model = E1ForMaskedLM.from_pretrained("Profluent-Bio/E1-300m", dtype=torch.float).to("cuda:0")
+model.eval()
+
+parent = "MKTIIALSYIFCLVFA"
+variants = [
+    "MKTIIALSYIFCLVFV",  # A→V at position 16
+    "MKTIIALSYIFCLAFA",  # V→A at position 15
+]
+
+# --- Wildtype marginal (fast) ---
+scorer_wt = E1Scorer(model, method=EncoderScoreMethod.WILDTYPE_MARGINAL)
+scores_wt = scorer_wt.score(parent_sequence=parent, sequences=variants)
+for s in scores_wt:
+    print(s["id"], s["score"])
+
+# --- Masked marginal (accurate) ---
+scorer_mm = E1Scorer(model, method=EncoderScoreMethod.MASKED_MARGINAL)
+scores_mm = scorer_mm.score(
+    parent_sequence=parent,
+    sequences=variants,
+    sequence_ids=["var_A16V", "var_V15A"],
+)
+for s in scores_mm:
+    print(s["id"], s["score"])
+```
+
+### With retrieval context and per-context scores
+
+```python
+context_seqs = {"hom_1": "MKTIIALSYIFCLVFG", "hom_2": "MKTIIALSYIFCLVFI"}
+
+scores = scorer_mm.score(
+    parent_sequence=parent,
+    sequences=variants,
+    context_seqs=context_seqs,
+    context_reduction="none",  # one row per variant × context
+)
+for s in scores:
+    print(s["id"], s["context_id"], s["score"])
+```

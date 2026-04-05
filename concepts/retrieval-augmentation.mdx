@@ -1,0 +1,92 @@
+---
+title: "Retrieval augmentation"
+description: "How E1 uses homologous sequences to improve protein representations."
+---
+
+E1 can condition its representations on homologous protein sequences by prepending them as context before the query. This retrieval-augmented mode often improves per-residue log-likelihoods and downstream task performance compared to running the query alone.
+
+## Input format
+
+<Note>
+Context sequences and the query are passed as a single comma-separated string. E1 splits on commas to identify sequence boundaries — do not use commas within individual sequence strings.
+</Note>
+
+To run E1 with one or more homologs as context, concatenate them with the query using commas:
+
+```
+"HOM1,HOM2,QUERY"
+```
+
+The query is always the **last** (rightmost) sequence. You can include up to 511 homologs before the query (the combined limit is 512 sequences including the query, set by `max_num_sequences`).
+
+`E1BatchPreparer.prepare_multiseq` splits the string on `,`, tokenizes each subsequence independently with `prepare_singleseq`, then concatenates the resulting token streams. Labels for context sequences are masked out by default (set to `<pad>` token ID), so training loss is computed only on the query.
+
+## Block-causal attention
+
+Under the hood, E1 builds a **block-causal mask** from `sequence_ids` using PyTorch FlexAttention. The rule is simple: a token can attend to any token with a `sequence_id` that is less than or equal to its own.
+
+This means:
+
+- Each context sequence attends to itself and all earlier context sequences.
+- The query (highest `sequence_id`) attends to all context sequences and itself.
+- Context sequences cannot attend to the query, so the query does not leak into the context representations.
+
+The mask is computed once in `E1Model.forward` via `create_block_causal_mask_optimized` and reused across all layers.
+
+## KV-cache for scoring many variants
+
+<Tip>
+When scoring many mutants of the same protein against a fixed set of homologs, use `use_cache=True` with `E1Predictor`. The context key-value tensors are computed once and cached in a `DynamicCache`. Subsequent calls with only the query sequence changed reuse the cached context KVs, reducing compute to the query tokens only. This can yield large speedups when the context is long relative to the query.
+</Tip>
+
+## Choosing context sequences
+
+Use `sample_context()` from `E1.msa_sampling` to select diverse homologs from an A3M multiple sequence alignment file:
+
+```python
+from E1.msa_sampling import sample_context
+
+context, context_ids = sample_context(
+    msa_path="query.a3m",
+    max_num_samples=511,          # at most 511 homologs
+    max_token_length=32768,       # total residues across all context sequences
+    min_query_similarity=0.0,
+    max_query_similarity=1.0,
+    seed=0,
+)
+
+# context is a comma-separated string ready to prepend to the query
+full_input = f"{context},{query_sequence}"
+```
+
+`sample_context` weights sampling inversely by the number of neighbors each sequence has (sequences in dense clusters are down-weighted), promoting diversity in the selected context.
+
+### Key parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `max_num_samples` | 511 | Maximum number of context sequences to sample |
+| `max_token_length` | 32768 | Total residue budget across all sampled sequences |
+| `min_query_similarity` | 0.0 | Minimum sequence identity to the query |
+| `max_query_similarity` | 1.0 | Maximum sequence identity to the query |
+| `neighbor_similarity_lower_bound` | 0.8 | Similarity threshold used to define a neighbor when computing sampling weights |
+
+## Limits
+
+| Limit | Value | Config parameter |
+|---|---|---|
+| Maximum context sequences | 511 | `max_num_sequences - 1` (default 512 total) |
+| Maximum residues per sequence | 8192 | `max_num_positions_within_seq` |
+
+Exceeding `max_num_sequences` raises a `ValueError` in `prepare_multiseq` before any GPU memory is allocated.
+
+## Extracting query outputs
+
+After a forward pass with context, use `sequence_ids` to isolate the query's hidden states. The query always has the maximum `sequence_id` value in the batch:
+
+```python
+query_mask = sequence_ids == sequence_ids.max(dim=-1, keepdim=True).values
+query_embeddings = embeddings[query_mask]
+```
+
+This `last_sequence_selector` pattern ensures you never accidentally mix context and query representations in downstream computations.

@@ -1,0 +1,83 @@
+---
+title: "Installation"
+description: "Install Profluent E1 and its dependencies."
+---
+
+<Warning>
+  E1 requires **Python &gt;=3.12, &lt;3.14**. Versions outside this range are not supported.
+</Warning>
+
+## Prerequisites
+
+- Python `>=3.12, <3.14`
+- PyTorch `>=2.7.0, <2.9.0` (installed automatically as a dependency)
+- Git
+
+## Install E1
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/Profluent-AI/E1.git
+    ```
+  </Step>
+
+  <Step title="Install the package">
+    Install E1 and all required dependencies in editable mode:
+
+    ```bash
+    cd E1 && pip3 install -e .
+    ```
+
+    This installs the following key dependencies automatically:
+
+    | Package | Version |
+    |---------|---------|
+    | `torch` | `>=2.7.0, <2.9.0` |
+    | `transformers` | `<4.57.0` |
+    | `tokenizers` | latest |
+    | `biotite` | latest |
+    | `scipy` | latest |
+    | `einops` | latest |
+    | `polars` | latest |
+    | `pandas` | latest |
+    | `tqdm` | latest |
+  </Step>
+
+  <Step title="(Optional) Install flash-attn">
+    If your GPU has CUDA capability 8.0 or higher (Ampere architecture or newer — for example, A100, H100, L40), install `flash-attn` for faster attention computation:
+
+    ```bash
+    pip3 install flash-attn --no-build-isolation
+    ```
+
+    <Note>
+      `flash-attn` is optional but recommended for GPU users. E1 detects and enables flash attention automatically when the package is installed. You do not need to change any code.
+    </Note>
+  </Step>
+</Steps>
+
+## Compute requirements
+
+E1 can run on both CPU and GPU, but a GPU is strongly recommended for practical inference speeds.
+
+| Requirement | Details |
+|-------------|---------|
+| **Precision** | BF16 (bfloat16) for best performance; E1 was trained in BF16 |
+| **Recommended GPU** | NVIDIA L40, A100, or H100 (CUDA capability 8.0+) |
+| **Flash attention** | Enabled automatically on CUDA 8.0+ when `flash-attn` is installed |
+| **CPU** | Supported, but substantially slower |
+
+<Note>
+  CUDA capability 8.0 corresponds to the Ampere architecture. You can check your GPU's compute capability at [developer.nvidia.com/cuda-gpus](https://developer.nvidia.com/cuda-gpus).
+</Note>
+
+## Verify installation
+
+After installation, verify that E1 imports correctly:
+
+```python
+from E1.modeling import E1ForMaskedLM
+from E1.batch_preparer import E1BatchPreparer
+print("E1 installed successfully")
+```
